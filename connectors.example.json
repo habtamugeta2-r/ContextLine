@@ -1,0 +1,10 @@
+{
+  "connectors": [
+    { "id": "vectors", "type": "pgvector", "schema": "public", "table": "document_chunks", "idColumn": "id", "tenantColumn": "tenant_id" },
+    { "id": "answers", "type": "redis", "requireTenantPrefix": true },
+    { "id": "memory", "type": "postgres", "tables": {
+      "summaries": { "schema": "public", "table": "conversation_summaries", "idColumn": "id", "tenantColumn": "tenant_id", "statusColumn": "status" },
+      "facts": { "schema": "public", "table": "agent_facts", "idColumn": "id", "tenantColumn": "tenant_id", "statusColumn": "status" }
+    } }
+  ]
+}

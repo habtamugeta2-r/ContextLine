@@ -1,0 +1,54 @@
+{
+  "date": "2026-11-07T18:00:06.123Z",
+  "node": "v22.22.3",
+  "postgresql": "17.9",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "cpuCount": 2,
+  "memoryGiB": 4,
+  "tenants": 50,
+  "dependencyRows": 1000000,
+  "artifactsPerTenant": 5000,
+  "rootsPerArtifact": 4,
+  "candidatesPerRequest": 10,
+  "iterations": 10000,
+  "warmup": 20,
+  "seedSeconds": 58.9,
+  "registration": {
+    "artifactsPerStatement": 500,
+    "bulkWritesPerBatch": 2,
+    "artifactsPerSecond": 4246
+  },
+  "lookup": {
+    "p50Ms": 0.81,
+    "p95Ms": 1.16,
+    "maxMs": 17.87,
+    "roundTrips": 1
+  },
+  "filterAuthorized": {
+    "p50Ms": 2.28,
+    "p95Ms": 3.18,
+    "maxMs": 36.2
+  },
+  "warmCache": {
+    "p50Ms": 2.31,
+    "p95Ms": 3.5
+  },
+  "includes": [
+    "single-round-trip dependency lookup",
+    "synthetic authorization callback",
+    "durable audit write"
+  ],
+  "excludes": [
+    "vector search",
+    "network authorization service",
+    "LLM inference",
+    "run creation"
+  ],
+  "gates": {
+    "lookupP95Under2Ms": true,
+    "filterP95Under5Ms": true,
+    "warmCacheP95Under2_5Ms": false
+  },
+  "allGatesMet": false,
+  "warning": "Local synthetic microbenchmark on shared sandbox hardware, not a production latency or scale claim."
+}

@@ -1,0 +1,76 @@
+name: CI
+on:
+  push:
+    branches: [main, 'arena/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: contextline_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d contextline_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build
+        run: npm run build > build.log 2>&1
+      - name: Example typecheck
+        run: npm run typecheck:examples > examples.log 2>&1
+      - name: Blueprint gates (SDK deps, bundle size, storage boundary)
+        run: npm run gates > gates.log 2>&1
+      - name: Unit tests
+        run: npm run test:unit > unit.log 2>&1
+      - name: PostgreSQL tests
+        run: npm run test:postgres > postgres.log 2>&1
+      - name: HTTP smoke
+        run: npm run smoke > smoke.log 2>&1
+      - name: Live connector tests
+        run: npm run test:live > live.log 2>&1
+        env:
+          CONTEXTLINE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/contextline_test
+          CONTEXTLINE_TEST_PGVECTOR: '1'
+          REDIS_URL: redis://localhost:6379
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high > audit.log 2>&1
+      - name: Container build
+        run: docker build -t contextline-worker:ci . > docker.log 2>&1
+      - name: Surface failure tails as annotations
+        if: failure()
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const files = ['build.log','examples.log','gates.log','unit.log','postgres.log','smoke.log','live.log','audit.log','docker.log','benchmark.log'];
+          if (fs.existsSync('.contextline')) {
+            for (const dir of fs.readdirSync('.contextline')) {
+              const log = `.contextline/${dir}/server.log`;
+              if (fs.existsSync(log)) files.push(log);
+            }
+          }
+          for (const file of files) {
+            if (!fs.existsSync(file)) continue;
+            const text = fs.readFileSync(file, 'utf8');
+            const tail = text.split('\n').slice(-60).join(' | ');
+            const escaped = tail.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A').slice(0, 3500);
+            console.log(`::error title=${file} tail::${escaped}`);
+          }
+          NODE

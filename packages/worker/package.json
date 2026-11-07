@@ -1,0 +1,34 @@
+{
+  "name": "@contextline/worker",
+  "version": "0.2.0",
+  "description": "Durable, verified AI artifact lifecycle propagation",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "contextline-worker": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@contextline/core": "0.2.0",
+    "ioredis": "5.11.1",
+    "pg": "8.23.1"
+  },
+  "license": "Apache-2.0"
+}

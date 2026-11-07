@@ -1,0 +1,12 @@
+ContextLine
+Copyright 2026 ContextLine contributors
+
+This repository contains an original reference implementation based on the
+product brief supplied by the repository owner. Apache-2.0 applies to the
+project source unless a file explicitly states otherwise.
+
+Development/demo dependencies are separately licensed. The embedded-postgres
+wrapper is MIT; its Zonky-derived PostgreSQL binaries are Apache-2.0 with
+third-party components under their own licenses. See docs/third-party.md.
+No PostgreSQL binaries, node_modules, local databases, or generated build
+output are intended to be tracked in Git.
