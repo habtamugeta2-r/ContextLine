@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -26,8 +26,8 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -36,11 +36,6 @@ jobs:
         run: npm run build > build.log 2>&1
       - name: Unit tests
         run: npm run test:unit > unit.log 2>&1
-      - name: Inspect embedded PostgreSQL binaries
-        run: |
-          native=node_modules/@embedded-postgres/linux-x64/native/bin
-          "$native/postgres" --version || true
-          ldd "$native/postgres" || true
       - name: PostgreSQL tests
         run: npm run test:postgres > postgres.log 2>&1
       - name: HTTP smoke
