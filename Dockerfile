@@ -6,7 +6,7 @@ COPY packages/worker/package.json packages/worker/package.json
 COPY apps/demo/package.json apps/demo/package.json
 RUN npm ci --no-audit --no-fund
 COPY . .
-RUN npm run build
+RUN npm run build && test -f packages/core/dist/cli.js && test -f packages/worker/dist/cli.js
 
 FROM node:22-bookworm-slim AS runtime
 ENV NODE_ENV=production
