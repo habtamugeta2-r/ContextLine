@@ -99,7 +99,7 @@ Use least-privilege storage credentials. A PostgreSQL connector needs SELECT/DEL
 
 ## 6. Docker and Compose
 
-`Dockerfile` is a multi-stage Node 22 slim build. It compiles TypeScript, copies migration assets, prunes development dependencies, and runs as the non-root `node` user. The default command starts the worker. Migration is a separate one-shot command.
+`Dockerfile` is a multi-stage Node 22 slim build. The build stage compiles TypeScript and copies migration assets; the runtime stage installs production dependencies separately, copies the compiled core/worker packages, and runs as the non-root `node` user. The default command starts the worker. Migration is a separate one-shot command.
 
 `compose.yaml` provides a local qualification stack:
 
