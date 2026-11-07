@@ -8,6 +8,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -31,11 +32,35 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run check
-      - run: npm run test:live
+      - name: Build
+        run: npm run build > build.log 2>&1
+      - name: Unit tests
+        run: npm run test:unit > unit.log 2>&1
+      - name: PostgreSQL tests
+        run: npm run test:postgres > postgres.log 2>&1
+      - name: HTTP smoke
+        run: npm run smoke > smoke.log 2>&1
+      - name: Live connector tests
+        run: npm run test:live > live.log 2>&1
         env:
           CONTEXTLINE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/contextline_test
           CONTEXTLINE_TEST_PGVECTOR: '1'
           REDIS_URL: redis://localhost:6379
-      - run: npm audit --omit=dev --audit-level=high
-      - run: docker build -t contextline-worker:ci .
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high > audit.log 2>&1
+      - name: Container build
+        run: docker build -t contextline-worker:ci . > docker.log 2>&1
+      - name: Surface failure tails as annotations
+        if: failure()
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const files = ['build.log','unit.log','postgres.log','smoke.log','live.log','audit.log','docker.log'];
+          for (const file of files) {
+            if (!fs.existsSync(file)) continue;
+            const text = fs.readFileSync(file, 'utf8');
+            const tail = text.split('\n').slice(-60).join(' | ');
+            const escaped = tail.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A').slice(0, 3500);
+            console.log(`::error title=${file} tail::${escaped}`);
+          }
+          NODE
