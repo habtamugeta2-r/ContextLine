@@ -7,7 +7,7 @@ ContextLine is an application-infrastructure layer between authoritative source 
 The implementation has three runtime components:
 
 1. **Core SDK (`@contextline/core`)**: registration, retrieval enforcement, source events, and audit writes.
-2. **PostgreSQL registry**: seven tenant-scoped tables plus a migration ledger. Four tables carry the domain model; three add durable per-artifact jobs and access audit.
+2. **PostgreSQL registry**: eight tenant-scoped tables plus a migration ledger. Five tables carry the domain model (sources, artifacts, dependencies, lifecycle events, quarantine manifest); three add durable per-artifact jobs and access audit.
 3. **Worker (`@contextline/worker`)**: claims lifecycle jobs, invokes configured storage connectors, verifies outcomes, and records progress.
 
 The interactive dashboard is a separate demonstration application. A hosted control plane is described in the product strategy but is **not implemented**. No configuration or data is sent to a ContextLine SaaS service.
@@ -113,6 +113,7 @@ The decision is linearized at the authoritative authorization check, with regist
 | `permission_granted` | Audit only; principals required | None. Does not clear source-wide restriction or resurrect artifacts. |
 | `source_restricted` | All source versions become `revoked` | Invalidate derivatives; memory may be flagged for review. |
 | `source_reactivated` | Source versions become `active` | None. Previously invalidated artifacts stay blocked until explicitly regenerated/reviewed. |
+| `permission_revoked` (principal-scoped) | Source status unchanged | Only the affected principals' **cache** (delete) and **memory** (review flag by default). Shared embeddings and summaries are never touched. |
 | `document_updated` | Insert exactly current version + 1; old version stops being current | Invalidate old-version derivatives. |
 | `document_deleted` | All versions become `deleted` | Delete all known derivatives. |
 | `gdpr_erasure_requested` | All versions become `deleted` | Delete all known derivatives, including memory; legal review remains external. |
@@ -152,3 +153,25 @@ This is a **conditional fail-closed design**, not a universal guarantee: explici
 SDK instances and workers run near the application and registry. Multiple workers can share a tenant queue; PostgreSQL locks distribute claims. The current worker requires an explicit tenant list and uses one tenant context per transaction. A large deployment can run one worker pool per tenant or tenant cohort.
 
 The demo runs all components in one process for convenience. Production should separate application replicas, worker replicas, PostgreSQL, and storage services, with independent credentials and network policy. See [deployment](deployment.md).
+
+
+## The read path is one round-trip
+
+`filterAuthorized` issues exactly one registry query: a call to the `lookup_artifacts` SQL function with
+parallel arrays of candidate IDs and versions. The function sets the tenant GUC and then scans, so RLS
+still applies and a pooled connection never carries another tenant's context. Every predicate also
+filters by tenant explicitly, so a GUC that failed to apply can only under-return rows.
+
+A `set_config` CTE was tried first and **does not work**: PostgreSQL evaluates the RLS policy as a
+one-time filter before the CTE runs, so the read returns zero rows. See [schema](schema.md) §9 and
+[ADR-015](decisions.md).
+
+Measured at 1,000,000 dependency rows across 50 tenants: lookup p95 **1.16ms**, end-to-end
+`filterAuthorized` p95 **3.18ms** including the durable audit write. See [validation](validation.md).
+
+## The write path is set-based
+
+Registration issues at most three bulk writes in one transaction — optional new sources, artifacts, and
+dependency edges — regardless of batch size (up to 500 artifacts). Source rows are locked `FOR SHARE`
+and checked for active/current status in the same transaction, which closes the register-versus-revoke
+race. Conflicts are `DO NOTHING`: an exact retry is a no-op, and a deleted version stays a tombstone.

@@ -1,6 +1,6 @@
 # SDK and API reference
 
-Package: `@contextline/core` · Node.js 22+ · ESM · TypeScript declarations included after build. The package is workspace-local in v0.1.0, not published to npm.
+Package: `@contextline/core` · Node.js 22+ · ESM · TypeScript declarations included after build. The package is workspace-local, not published to npm.
 
 ## 1. Construction and migrations
 
@@ -184,7 +184,7 @@ const event = await ctx.recordSourceEvent({
 
 Supported events and effects are listed in [architecture](architecture.md). Principal events require a nonempty principal list and do not delete shared storage. `source_restricted`/`source_reactivated` are explicit source-wide controls. `document_updated` requires exactly the next version.
 
-`memoryAction` applies only to `source_restricted`: `flag` (default), `invalidate`, or `delete`. Erasure/deletion/retirement events always delete memory regardless of this setting.
+`memoryAction` applies to `source_restricted`, `retention_expired`, and `permission_revoked`: `flag` (default), `invalidate`, or `delete`. Erasure and deletion events always delete memory regardless of this setting.
 
 Idempotency keys are tenant-scoped. Reusing a key with the same canonical payload returns the existing event; changing the payload throws `IDEMPOTENCY_CONFLICT`. Without a key, each call records a new audit event even if connector actions are idempotent.
 
@@ -247,3 +247,52 @@ worker.start();
 Connector errors use `ConnectorError` codes such as `CONNECTOR_NOT_CONFIGURED`, `CONNECTOR_TIMEOUT`, `VERIFICATION_FAILED`, `UNKNOWN_TABLE`, and `TENANT_PREFIX_REQUIRED`. Raw connector errors are not written to job history.
 
 IDs are limited to 512 characters, storage references to 1,024, connector IDs to 64, and principal lists to 100. Schema names are restricted to lowercase SQL identifiers. These are safety bounds, not performance guarantees.
+
+
+## Blueprint conformance additions (0.2.0)
+
+### `ContextLineOptions`
+
+| Option | Default | Meaning |
+|---|---|---|
+| `auditPolicy` | `'required'` | An unauditable allow decision is blocked |
+| `authCache` | disabled | `{ enabled, ttlMs, maxEntries }`. Allow-only; `ttlMs` is hard-capped at 30000 and validated at construction |
+| `quarantineFlush` | `{ intervalMs: 5000, maxItems: 100 }` | Background manifest flush; never on the request path |
+
+### `EnforcementOptions.authorizeMode`
+
+`'batch'` (default) sends every unique root in one callback invocation. `'per-source'` implements the
+blueprint literally: one timed call per unique source, in parallel. Both deduplicate by source ID,
+enforce the same timeout, and require every root to authorize.
+
+### New methods
+
+| Method | Behavior |
+|---|---|
+| `ctx.flushQuarantine()` | Flush the buffered manifest hits now; resolves when the write settles |
+| `ctx.close()` | Stop the flush timer, flush the buffer, clear the auth cache. The caller still owns the pool |
+| `registry.recordQuarantineHits(tenantId, hits)` | Bulk upsert with occurrence counting |
+| `registry.listQuarantine(tenantId, includeResolved?)` | Manifest rows for backfill |
+| `registry.resolveQuarantine(tenantId, refs)` | Mark rows resolved; does not change the artifact |
+| `registry.heartbeatJob(job, leaseMs)` | Extend a live lease; returns false for a stale token |
+
+### Registration additions
+
+- `createSources?: boolean` — bulk-insert missing **version-1** sources in the same transaction. It can
+  never reactivate a revoked, deleted, or expired source.
+- `ArtifactRegistration.ownerPrincipal?: string` — opaque owner. Required for principal-scoped cleanup
+  of personal cache/memory artifacts.
+- Artifact batches are capped at **500** (previously 100); root sources remain capped at 100.
+
+### Cache staleness bound
+
+With `authCache` enabled, an allow decision may be reused for up to `ttlMs` (≤30s) **within one process**.
+`recordSourceEvent` purges that source locally; other processes converge at the TTL. Registry lifecycle
+state is always read fresh, so a cached allow can never override a revoked, deleted, expired, or outdated
+source. Denials are never cached.
+
+### Error codes added
+
+`SOURCE_UNAVAILABLE`, `CONCURRENT_REGISTRATION`, `INVALID_CONFIG`, `INVALID_STORAGE_REFERENCE`,
+`INVALID_CONNECTOR_CONFIGURATION`. `QUARANTINE_FLUSH_FAILED` is emitted as a diagnostic, never thrown
+into the request path.

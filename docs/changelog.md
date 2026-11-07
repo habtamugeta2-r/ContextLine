@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.0 — 2026-11-07 (blueprint conformance)
+
+Acts on the three supplied blueprint passes; the **Revised** pass governs conflicts.
+
+### Added
+- `docs/blueprint/` records the authoritative blueprint; `docs/blueprint-conflicts.md` resolves every
+  disagreement between the three passes; `docs/conformance.md` tracks 96 requirements with evidence.
+- Migration 002: covering backward index, `artifacts.owner_principal`, `lifecycle_events.scope`,
+  `quarantine_manifest`, and the `lookup_artifacts` security-invoker function.
+- Single-round-trip hot read; set-based bulk registration (at most 3 writes, 500-artifact batches);
+  optional `createSources`.
+- Principal-scoped propagation, the exported action matrix, retry jitter, non-retryable dead letters,
+  job heartbeats, connector-health metrics, and a bounded graceful drain.
+- Opt-in allow-only auth cache (30s cap), `authorizeMode: 'per-source'`, buffered quarantine with
+  `flushQuarantine()`/`close()`, and the quarantine backfill CLI.
+- Canonical `connector:target:record` parser; pgvector invalidation falls back to deletion;
+  memory invalidation writes `pending_review`; Redis invalidation deletes by default.
+- `npm run gates` (SDK deps, gzipped size, storage-access boundary), `npm run typecheck:examples`,
+  five adoption-stage examples, five chaos scenarios, and a nightly benchmark workflow.
+
+### Changed
+- **`filterAuthorized` p95 fell from 136.87ms to 3.18ms** at 27x the data scale (1M dependency rows,
+  50 tenants, 10,000 measured calls). Backward-lookup p95 is 1.16ms.
+- Source-wide restriction/retention now **delete** embeddings, caches, and summaries (previously
+  invalidated); `document_updated` deletes caches and marks other types stale.
+- Principal revocation now propagates to that principal's cache and memory instead of being audit-only.
+- Tests: 47 unit, 41 PostgreSQL. The Redis live test covers both invalidation modes.
+
+### Fixed
+- A `set_config` CTE cannot establish tenant context under RLS: PostgreSQL evaluates the policy as a
+  one-time filter before the CTE runs, so the read silently returns zero rows. The hot path uses a
+  `SECURITY INVOKER` function instead, which is both correct and one round-trip.
+
 ## 0.1.0 — 2026-11-07
 
 Initial working reference implementation recorded in the repository.

@@ -4,7 +4,7 @@
 
 When a document is chunked, embedded, cached, summarized, or remembered by an agent, its permission boundary must survive those transformations. ContextLine connects derivative artifacts to their root sources, checks the caller's current authorization before retrieval, and propagates source lifecycle changes through a durable, verified worker.
 
-> **Status: working local reference implementation, v0.1.0.** The SDK, PostgreSQL registry, lifecycle worker, connector adapters, interactive demo, and automated tests are implemented. A hosted control plane, enterprise SSO, managed operations, and production scale/latency guarantees are not. Read the [security model](docs/security.md) and [validation results](docs/validation.md) before evaluating it for production.
+> **Status: working local reference implementation, v0.2.0.** The SDK, PostgreSQL registry, lifecycle worker, connector adapters, interactive demo, and automated tests are implemented. A hosted control plane, enterprise SSO, managed operations, and production scale/latency guarantees are not. Read the [security model](docs/security.md) and [validation results](docs/validation.md) before evaluating it for production.
 
 ## Run it
 
@@ -33,13 +33,29 @@ The demo uses synthetic facts, deterministic retrieval, and separate PostgreSQL 
 | Capability | Implementation |
 |---|---|
 | Dependency registry | Versioned root-source edges; multi-source artifacts; flattened transitive registration; idempotent, immutable artifact identity/provenance |
-| Access enforcement | Batched customer authorization callback; all-root AND semantics; unknown-provenance deny/quarantine; timeout and error policies; durable access decisions |
-| Lifecycle propagation | Transactional event outbox; `SKIP LOCKED` claims; expiring leases and fencing tokens; retries; dead letters; human-review state; connector verification |
+| Access enforcement | **One-round-trip** batched lookup; customer authorization callback; all-root AND semantics; unknown-provenance deny/quarantine with a buffered manifest; timeout and error policies; durable access decisions; opt-in allow-only cache |
+| Lifecycle propagation | Transactional event outbox; principal-scoped vs source-wide blast radius; `SKIP LOCKED` claims; expiring leases, heartbeats, and fencing tokens; jittered retries; non-retryable dead letters; human-review state; connector verification |
 | Tenant isolation | Tenant-inclusive keys and foreign keys; forced PostgreSQL RLS; least-privilege runtime grants; tenant-prefixed Redis keys by default |
-| Storage adapters | Generic PostgreSQL tables, pgvector row deletion, Redis delete/TTL-preserving invalidation; programmable custom connector interface |
+| Storage adapters | Generic PostgreSQL tables (memory → review), pgvector delete with invalidation fallback, Redis delete-by-default; canonical `connector:target:record` parser; programmable custom connector interface |
 | Developer experience | TypeScript packages, migration CLI, worker CLI, interactive dashboard, terminal demo, Docker/Compose files, CI, tests, and detailed documentation |
 
-The core runtime has one direct dependency: `pg`. The worker adds `ioredis`. The dashboard uses browser-native JavaScript and CSS.
+The core runtime has one direct dependency: `pg`. The worker adds `ioredis`. The dashboard uses browser-native JavaScript and CSS. Three CI gates protect those promises: the SDK dependency list must be exactly `pg`, the shipped SDK must stay under 50KB gzipped (currently 17.5KB), and no code outside the registry store and connectors may issue SQL.
+
+### Measured, not promised
+
+At **1,000,000 dependency rows across 50 tenants**, 10 candidates per request, 10,000 measured calls per phase, on a shared 2-vCPU sandbox:
+
+| Phase | p95 | Blueprint gate |
+|---|---|---|
+| Backward lookup (one round-trip) | **1.16ms** | <2.0ms — met |
+| `filterAuthorized` incl. durable audit | **3.18ms** | <5.0ms — met |
+| Warm allow cache | 3.50ms | <2.5ms — **not met** |
+
+The warm-cache gate is missed because the synthetic callback costs nothing, so caching removes no work while the durable audit write remains. These are local synthetic measurements, not a production SLA: see [validation](docs/validation.md) and the [full report](docs/benchmark-1m.json).
+
+## Blueprint conformance
+
+The engineering blueprint supplied for this project is recorded verbatim in [docs/blueprint/](docs/blueprint/README.md). Where its three passes disagree, [docs/blueprint-conflicts.md](docs/blueprint-conflicts.md) records the chosen behavior and why; [docs/conformance.md](docs/conformance.md) tracks all 96 requirements with evidence (80 met, 10 partial, 4 deliberate deviations, 1 deferred, 1 not met). Five copy-paste adoption paths live in [examples/](examples/README.md) and are type-checked in CI.
 
 ## Three capabilities, one boundary
 

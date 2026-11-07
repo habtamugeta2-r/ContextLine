@@ -148,7 +148,7 @@ export class DemoApp {
       try {
         await client.query('BEGIN');await client.query("SELECT set_config('app.current_tenant',$1,true)",[tenant]);
         if(role==='contextline_owner') {
-          for(const table of ['lifecycle_jobs','access_decisions','lifecycle_events','access_runs','dependencies','artifacts','sources'])await client.query(`DELETE FROM contextline.${table} WHERE tenant_id=$1`,[tenant]);
+          for(const table of ['lifecycle_jobs','access_decisions','lifecycle_events','access_runs','quarantine_manifest','dependencies','artifacts','sources'])await client.query(`DELETE FROM contextline.${table} WHERE tenant_id=$1`,[tenant]);
         }
         for(const table of ['demo_acl','demo_chunks','demo_cache','demo_summaries','demo_memories','demo_state'])await client.query(`DELETE FROM ${table} WHERE tenant_id=$1`,[tenant]);
         await client.query('COMMIT');

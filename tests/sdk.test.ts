@@ -11,7 +11,7 @@ class FakeRegistry implements RegistryStore {
   async beginRun(tenantId:string,principal:string){const run={id:randomUUID(),tenantId,principal};this.runs.set(run.id,run);return run;}
   async recordDecisions(run:Run,decisions:AccessDecision[]){if(this.failAudit)throw new Error('audit unavailable');const known=this.runs.get(run.id);if(!known||known.principal!==run.principal||known.tenantId!==run.tenantId)throw new Error('invalid run');this.decisions.push(...decisions);}
   async recordSourceEvent():Promise<any>{throw new Error('not used');}
-  add(id:string,sources:SourceState[],status:ArtifactStatus='active'){this.records.set(JSON.stringify([id,1]),{artifact:{id,version:1,type:'embedding',connectorId:'test',storageRef:id,tenantId:'t',status,createdAt:'',updatedAt:''},sources});}
+  add(id:string,sources:SourceState[],status:ArtifactStatus='active'){this.records.set(JSON.stringify([id,1]),{artifact:{id,version:1,type:'embedding',connectorId:'test',storageRef:id,tenantId:'t',status,ownerPrincipal:null,createdAt:'',updatedAt:''},sources});}
 }
 const root:SourceState={id:'s1',version:1,status:'active',isCurrent:true};
 const allow=async(request:{sources:{id:string}[]})=>Object.fromEntries(request.sources.map(s=>[s.id,true]));

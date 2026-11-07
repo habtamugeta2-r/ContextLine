@@ -29,7 +29,7 @@ Status legend: **Implemented** = executable code and tests; **Partial** = usable
 | 21 | Privacy/erasure/legal analysis | Documented + technical workflow | Metadata privacy, conditional GDPR workflow; no compliance certification |
 | 22 | Observability and operations | Partial | Prometheus counters/gauges, health, runbooks; latency histograms/oldest-age deferred |
 | 23 | Reproducible revocation demo | Implemented | Interactive UI + CLI + HTTP smoke; synthetic data, no LLM |
-| 24 | Automated testing | Implemented + optional live | 35 unit, 28 real-PG, smoke; Redis/pgvector live path not locally run |
+| 24 | Automated testing | Implemented + optional live | 47 unit, 41 real-PG (5 chaos), smoke, gates, example typecheck; Redis/pgvector live path runs in CI, not locally |
 | 25 | Performance targets | Measured, target unmet | Local durable-audit p95 ~137ms; `<5ms` remains unachieved target |
 | 26 | Market size and adoption-barrier claims | Documented as hypotheses | No verified ranking/TAM; discovery plan and assumption formulas |
 | 27 | Competitive landscape | Documented | Prior art and gaps; no invented competitor ARR or absence claims |

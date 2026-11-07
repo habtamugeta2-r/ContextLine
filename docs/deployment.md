@@ -75,7 +75,10 @@ Every application request must derive tenant/principal from trusted authenticati
 | `CONTEXTLINE_POOL_SIZE` | 10 | Worker PostgreSQL pool |
 | `CONTEXTLINE_BATCH_SIZE` | 20 | Jobs claimed per tenant pass, 1–100 |
 | `CONTEXTLINE_CONCURRENCY` | 4 | Connector operations in parallel, 1–20 |
-| `CONTEXTLINE_INTERVAL_MS` | 500 | Idle polling interval |
+| `CONTEXTLINE_INTERVAL_MS` | 1000 | Idle polling interval |
+| `CONTEXTLINE_EVENTS_PER_PASS` | 5 | Events materialized per tenant per pass |
+| `CONTEXTLINE_HEARTBEAT_MS` | lease/3 | Extends a live job lease while a connector call runs |
+| `CONTEXTLINE_DRAIN_TIMEOUT_MS` | 30000 | Graceful drain window on SIGTERM |
 | `CONTEXTLINE_LEASE_MS` | 60000 | Job visibility lease |
 | `CONTEXTLINE_OPERATION_TIMEOUT_MS` | 10000 | Per connector operation timeout |
 | `CONTEXTLINE_MAX_ATTEMPTS` | 6 | Total attempts before dead letter, 1–20 |
@@ -164,3 +167,27 @@ The registry is in the serving path. Use managed PostgreSQL HA or your standard 
 Workers can scale horizontally, but the current tenant list is static configuration. Tenant onboarding requires updating the worker deployment or running a dedicated worker. Dynamic tenant discovery/control-plane configuration is future work.
 
 The draft's `<5ms p95` and 100M-artifact figures are not release guarantees. Measure the complete path with your auth service, network, pool contention, audit writes, and storage fan-out. See the reproducible [benchmark script](../scripts/benchmark.ts) and [validation results](validation.md).
+
+
+## Connector configuration additions (0.2.0)
+
+```json
+{
+  "connectors": [
+    { "id": "pgvector", "type": "pgvector", "table": "embeddings", "statusColumn": "status" },
+    { "id": "redis", "type": "redis", "requireTenantPrefix": true, "invalidationMode": "delete" },
+    { "id": "app-tables", "type": "postgres", "tables": { "memories": { "table": "agent_memories", "statusColumn": "status" } } }
+  ]
+}
+```
+
+- `invalidationMode` defaults to `delete` (blueprint A). Set `tombstone` only if your application treats
+  the reserved poison value as a cache miss; it preserves the key's TTL.
+- A pgvector connector without `statusColumn` falls back to deletion for invalidation and verifies absence.
+- Generic tables write `pending_review` instead of `stale` when the artifact type is `memory`.
+
+## Registry function grant
+
+Migration 002 adds `lookup_artifacts(text, text[], integer[])`. `grantRuntimeRole` grants `EXECUTE` on it
+alongside the table privileges. If you provision roles by hand, grant it explicitly or the hot read will
+fail closed (permission denied → no content served).

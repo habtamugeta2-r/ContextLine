@@ -34,6 +34,10 @@ jobs:
       - run: npm ci
       - name: Build
         run: npm run build > build.log 2>&1
+      - name: Example typecheck
+        run: npm run typecheck:examples > examples.log 2>&1
+      - name: Blueprint gates (SDK deps, bundle size, storage boundary)
+        run: npm run gates > gates.log 2>&1
       - name: Unit tests
         run: npm run test:unit > unit.log 2>&1
       - name: PostgreSQL tests
@@ -55,7 +59,7 @@ jobs:
         run: |
           node <<'NODE'
           const fs = require('node:fs');
-          const files = ['build.log','unit.log','postgres.log','smoke.log','live.log','audit.log','docker.log'];
+          const files = ['build.log','examples.log','gates.log','unit.log','postgres.log','smoke.log','live.log','audit.log','docker.log','benchmark.log'];
           if (fs.existsSync('.contextline')) {
             for (const dir of fs.readdirSync('.contextline')) {
               const log = `.contextline/${dir}/server.log`;

@@ -14,12 +14,14 @@ export interface ArtifactRegistration {
   type: ArtifactType;
   connectorId: string;
   storageRef: string;
+  /** Opaque owner for principal-scoped cache/memory revocation. Never an email address. */
+  ownerPrincipal?: string | undefined;
 }
 export interface SourceState extends SourceRef { status: SourceStatus; isCurrent: boolean }
 export interface ArtifactRecord {
   id: string; version: number; type: ArtifactType; connectorId: string;
   storageRef: string; tenantId: string; status: ArtifactStatus;
-  createdAt: string; updatedAt: string;
+  ownerPrincipal: string | null; createdAt: string; updatedAt: string;
 }
 export interface ArtifactDependencies { artifact: ArtifactRecord; sources: SourceState[] }
 export interface Run { id: string; tenantId: string; principal: string }
@@ -38,6 +40,8 @@ export interface AuthorizationRequest { tenantId: string; principal: string; sou
 export type AuthorizationCallback = (request: AuthorizationRequest) => Promise<Record<string, boolean> | Map<string, boolean>>;
 export interface EnforcementOptions {
   authorize: AuthorizationCallback;
+  /** 'batch' (default) sends all unique roots in one call; 'per-source' matches blueprint A literally. */
+  authorizeMode?: 'batch' | 'per-source' | undefined;
   unregisteredPolicy?: 'deny' | 'allow' | 'quarantine' | undefined;
   onError?: 'deny' | 'allow' | 'skip' | undefined;
   timeoutMs?: number | undefined;
@@ -47,6 +51,8 @@ export interface EnforcementOptions {
 export interface AuthorizedArtifact<T> { artifact: T; sourceRefs: SourceRef[] }
 export interface RegisterDerivationInput {
   tenantId: string; sources: SourceRef[]; artifacts: ArtifactRegistration[];
+  /** Bulk-insert missing version-1 sources in the same transaction. Never reactivates a source. */
+  createSources?: boolean | undefined;
   /** Pass artifact IDs to resolve and flatten their root-source dependencies. */
   derivedFrom?: ArtifactRef[] | undefined;
   run?: Run | undefined;
@@ -61,7 +67,7 @@ export interface SourceEventInput {
 }
 export interface LifecycleEventRecord {
   id: string; tenantId: string; sourceId: string; sourceVersion: number;
-  eventType: EventType; affectedPrincipals: string[]; affectedArtifacts: number;
+  eventType: EventType; scope: EventScope; affectedPrincipals: string[]; affectedArtifacts: number;
   processedArtifacts: number; status: EventStatus; jobsReady: boolean;
   details: Record<string, unknown>; createdAt: string; startedAt: string | null; completedAt: string | null;
 }
@@ -82,4 +88,19 @@ export interface RegistryStore {
   beginRun(tenantId: string, principal: string): Promise<Run>;
   recordDecisions(run: Run, decisions: AccessDecision[], durationMs: number): Promise<void>;
   recordSourceEvent(input: SourceEventInput): Promise<LifecycleEventRecord>;
+}
+
+/** Blueprint A Part 0 B1: every lifecycle event declares its blast radius. */
+export type EventScope = 'principal' | 'source_wide';
+export interface QuarantineEntry {
+  artifactId: string; artifactVersion: number;
+  firstSeenAt: string; lastSeenAt: string; occurrenceCount: number; resolvedAt: string | null;
+}
+export interface QuarantineHit { artifactId: string; artifactVersion: number; count?: number }
+export interface AuthCacheOptions {
+  /** Off by default. Only allow results are ever cached. */
+  enabled?: boolean;
+  /** Hard-capped at 30_000ms by the SDK; the staleness bound is documented. */
+  ttlMs?: number;
+  maxEntries?: number;
 }

@@ -12,9 +12,9 @@ before(async()=>{f=await postgresFixture();});
 after(async()=>{await f?.cleanup();});
 const allow=async(req:{sources:SourceRef[]})=>Object.fromEntries(req.sources.map(s=>[s.id,true]));
 const source=(id:string,version=1):SourceRef=>({id,version});
-async function seed(t=tenant,id=randomUUID(),type:ArtifactType='embedding',roots:SourceRef[]=[source(`source:${id}`)]){
+async function seed(t=tenant,id=randomUUID(),type:ArtifactType='embedding',roots:SourceRef[]=[source(`source:${id}`)],ownerPrincipal?:string){
   for(const s of roots)await f.ctx.ensureSource(t,s);
-  const artifact={id:`artifact:${id}`,type,connectorId:'test-items',storageRef:`test-items/artifact:${id}`};
+  const artifact={id:`artifact:${id}`,type,connectorId:'test-items',storageRef:`test-items/artifact:${id}`,ownerPrincipal};
   await f.ctx.registerDerivation({tenantId:t,sources:roots,artifacts:[artifact]});
   await f.app.query('INSERT INTO test_items (tenant_id,id) VALUES ($1,$2)',[t,artifact.id]);
   return {artifact,roots};
@@ -27,7 +27,7 @@ async function serve(id:string){const run=await f.ctx.beginRun(tenant,'alice');r
 test('real PostgreSQL migrations are idempotent and force RLS on every core table',async()=>{
   await migrateRegistry(f.admin);await migrateRegistry(f.admin);
   const result=await f.admin.query("SELECT relname,relrowsecurity,relforcerowsecurity FROM pg_class WHERE relnamespace='contextline'::regnamespace AND relkind='r' AND relname <> 'schema_migrations'");
-  assert.equal(result.rowCount,7);for(const row of result.rows){assert.equal(row.relrowsecurity,true,row.relname);assert.equal(row.relforcerowsecurity,true,row.relname);}
+  assert.equal(result.rowCount,8);for(const row of result.rows){assert.equal(row.relrowsecurity,true,row.relname);assert.equal(row.relforcerowsecurity,true,row.relname);}
 });
 test('runtime role cannot bypass RLS, delete audit rows, or mutate migration history',async()=>{
   await seed();assert.equal((await f.app.query('SELECT * FROM contextline.artifacts')).rowCount,0);
@@ -71,9 +71,31 @@ test('unknown provenance is denied and quarantine is recorded for backfill',asyn
   const run=await f.ctx.beginRun(tenant,'alice');const result=await f.ctx.filterAuthorized({run,candidates:[{artifactId:'unregistered'}],authorize:allow,unregisteredPolicy:'quarantine'});
   assert.equal(result.length,0);assert.equal((await f.registry.listDecisions(tenant,run.id))[0]!.reason,'quarantined');
 });
-test('principal revocation is audit-only and preserves shared artifacts',async()=>{
-  const {artifact,roots}=await seed();const event=await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'permission_revoked',affectedPrincipals:['alice']});
-  assert.equal(event.status,'completed');assert.equal(event.affectedArtifacts,0);await worker().drain(tenant);assert.equal((await item(tenant,artifact.id)).status,'active');assert.equal((await serve(artifact.id)).length,1);
+test('principal revocation touches only that principal cache and memory, never shared derivatives',async()=>{
+  const root=source('principal-scope-root');
+  const shared=await seed(tenant,randomUUID(),'embedding',[root]);
+  const aliceCache=await seed(tenant,randomUUID(),'cache',[root],'alice');
+  const bobCache=await seed(tenant,randomUUID(),'cache',[root],'bob');
+  const aliceMemory=await seed(tenant,randomUUID(),'memory',[root],'alice');
+  const event=await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:root.id,event:'permission_revoked',affectedPrincipals:['alice']});
+  assert.equal(event.scope,'principal');
+  const materialized=await f.registry.materializeNextEvent(tenant);
+  assert.equal(materialized?.affectedArtifacts,2);
+  await worker().drain(tenant);
+  assert.equal(await item(tenant,aliceCache.artifact.id),undefined);
+  assert.equal((await item(tenant,aliceMemory.artifact.id)).status,'active');
+  assert.equal((await f.registry.lookupArtifacts(tenant,[{id:aliceMemory.artifact.id,version:1}]))[0]!.artifact.status,'pending_review');
+  assert.equal((await item(tenant,bobCache.artifact.id)).status,'active');
+  assert.equal((await item(tenant,shared.artifact.id)).status,'active');
+  assert.equal((await serve(shared.artifact.id)).length,1);
+  const jobs=await f.registry.listJobs(tenant,event.id);
+  assert.deepEqual(jobs.map(j=>j.action).sort(),['delete','flag']);
+});
+test('principal grants remain audit-only and create no storage work',async()=>{
+  const {artifact,roots}=await seed();
+  const event=await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'permission_granted',affectedPrincipals:['alice']});
+  assert.equal(event.status,'completed');assert.equal(event.scope,'principal');assert.equal(event.affectedArtifacts,0);
+  await worker().drain(tenant);assert.equal((await item(tenant,artifact.id)).status,'active');assert.equal((await serve(artifact.id)).length,1);
 });
 test('source deletion blocks immediately, then verifies every storage deletion',async()=>{
   const root=source('delete-root');const items=[await seed(tenant,randomUUID(),'embedding',[root]),await seed(tenant,randomUUID(),'cache',[root]),await seed(tenant,randomUUID(),'memory',[root])];
@@ -87,7 +109,11 @@ test('source deletion blocks immediately, then verifies every storage deletion',
 test('restriction flags memory for review, reports partial, and never serves flagged content',async()=>{
   const root=source('restrict-root');const memory=await seed(tenant,randomUUID(),'memory',[root]);const chunk=await seed(tenant,randomUUID(),'embedding',[root]);
   const event=await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:root.id,event:'source_restricted'});await worker().drain(tenant);
-  assert.equal((await f.registry.getEvent(tenant,event.id))?.status,'partial');assert.equal((await item(tenant,memory.artifact.id)).status,'active');assert.equal((await item(tenant,chunk.artifact.id)).status,'stale');assert.equal((await serve(memory.artifact.id)).length,0);
+  assert.equal((await f.registry.getEvent(tenant,event.id))?.status,'partial');assert.equal((await item(tenant,memory.artifact.id)).status,'active');
+  // Blueprint A matrix: revoked-for-everyone deletes embeddings but only flags memory.
+  assert.equal(await item(tenant,chunk.artifact.id),undefined);
+  assert.equal((await f.registry.lookupArtifacts(tenant,[{id:chunk.artifact.id,version:1}]))[0]!.artifact.status,'deleted');
+  assert.equal((await serve(memory.artifact.id)).length,0);
 });
 test('review acknowledgement closes the workflow but keeps the artifact blocked',async()=>{
   const root=source('review-ack-root');const {artifact}=await seed(tenant,randomUUID(),'memory',[root]);const event=await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:root.id,event:'source_restricted'});await worker().drain(tenant);
@@ -152,7 +178,7 @@ test('deleted-version tombstones cannot be resurrected by registration retries',
   await assert.rejects(f.ctx.registerDerivation({...input,artifacts:[{...artifact,id:'new-after-delete'}]}),{code:'SOURCE_UNAVAILABLE'});
 });
 test('reactivation and permission grants do not resurrect invalidated artifacts',async()=>{
-  const {artifact,roots}=await seed();await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'source_restricted'});await worker().drain(tenant);
+  const {artifact,roots}=await seed();await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'document_updated',newVersion:2});await worker().drain(tenant);
   await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'source_reactivated'});await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'permission_granted',affectedPrincipals:['alice']});
   assert.equal((await serve(artifact.id)).length,0);assert.equal((await f.registry.lookupArtifacts(tenant,[{id:artifact.id,version:1}]))[0]!.artifact.status,'stale');
 });
@@ -175,8 +201,8 @@ test('a forged run principal cannot produce an allowed response under required a
   const {artifact}=await seed();const run=await f.ctx.beginRun(tenant,'alice');const result=await f.ctx.filterAuthorized({run:{...run,principal:'bob'},candidates:[{artifactId:artifact.id}],authorize:allow});assert.equal(result.length,0);
 });
 test('erasure events are prioritized over earlier updates',async()=>{
-  const {roots}=await seed();await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'document_updated',newVersion:2});const erasure=await f.ctx.recordSourceEvent({tenantId:tenant,sourceId:roots[0]!.id,event:'gdpr_erasure_requested'});
-  const claimed=await f.registry.materializeNextEvent(tenant);assert.equal(claimed?.id,erasure.id);await worker().drain(tenant);
+  const t='priority-tenant';const {roots}=await seed(t);await f.ctx.recordSourceEvent({tenantId:t,sourceId:roots[0]!.id,event:'document_updated',newVersion:2});const erasure=await f.ctx.recordSourceEvent({tenantId:t,sourceId:roots[0]!.id,event:'gdpr_erasure_requested'});
+  const claimed=await f.registry.materializeNextEvent(t);assert.equal(claimed?.id,erasure.id);await worker(t).drain(t);
 });
 test('migration checksums detect edits to applied migrations',async()=>{
   await f.admin.query("UPDATE contextline.schema_migrations SET checksum='changed'");
@@ -186,5 +212,88 @@ test('migration checksums detect edits to applied migrations',async()=>{
 test('Prometheus tenant labels are escaped and queue counts are tenant-scoped',async()=>{
   const stats=await f.registry.queueStats('worker-a');assert.ok(stats.failed>=0);const text=f.registry.metricsText('a"b\\c',{processed:1,failures:2,claimed:3});assert.ok(text.includes('tenant="a\\"b\\\\c"'));assert.ok(text.includes('contextline_jobs_processed_total'));
   const combined=await new LifecycleWorker({registry:f.registry,tenants:['worker-a','worker-b'],connectors:{}}).metrics();
-  for(const metric of ['contextline_worker_up','contextline_jobs_processed_total','contextline_job_failures_total','contextline_jobs_claimed_total','contextline_queue_jobs','contextline_dead_letter_jobs','contextline_review_jobs'])assert.equal(combined.split('\n').filter(l=>l===`# TYPE ${metric} ${metric.includes('_total')?'counter':'gauge'}`).length,1,metric);
+  for(const metric of ['contextline_connector_healthy','contextline_worker_up','contextline_jobs_processed_total','contextline_job_failures_total','contextline_jobs_claimed_total','contextline_queue_jobs','contextline_dead_letter_jobs','contextline_review_jobs'])assert.equal(combined.split('\n').filter(l=>l===`# TYPE ${metric} ${metric.includes('_total')?'counter':'gauge'}`).length,1,metric);
+});
+
+test('bulk registration writes at most three statements for 500 artifacts',async()=>{
+  const t='bulk-tenant';
+  const roots=Array.from({length:20},(_,i)=>source(`bulk-root-${i+1}`));
+  const pool=f.registry.pool as any;
+  const originalConnect=pool.connect.bind(pool);
+  const statements:string[]=[];
+  pool.connect=async(...args:any[])=>{
+    const client=await originalConnect(...args);
+    const query=client.query.bind(client),release=client.release.bind(client);
+    client.query=(...a:any[])=>{statements.push(String(a[0]).trim());return query(...a);};
+    client.release=(...a:any[])=>{client.query=query;client.release=release;return release(...a);};
+    return client;
+  };
+  try{
+    await f.ctx.registerDerivation({tenantId:t,createSources:true,sources:roots,artifacts:Array.from({length:500},(_,i)=>({id:`bulk-artifact-${i+1}`,type:'embedding' as const,connectorId:'test-items',storageRef:`test-items/bulk-artifact-${i+1}`}))});
+  }finally{pool.connect=originalConnect;}
+  const writes=statements.filter(s=>/^INSERT/i.test(s));
+  assert.ok(writes.length<=3,`expected at most 3 bulk writes, saw ${writes.length}`);
+  assert.ok(writes.every(s=>/unnest\(/.test(s)),'every bulk write must be set-based');
+  assert.equal((await f.registry.listSources(t)).length,20);
+  assert.equal((await f.registry.listArtifacts(t)).length,500);
+});
+test('createSources never reactivates a revoked source',async()=>{
+  const t='create-sources-tenant';
+  await f.ctx.registerDerivation({tenantId:t,createSources:true,sources:[source('cs-root')],artifacts:[{id:'cs-one',type:'embedding',connectorId:'test-items',storageRef:'test-items/cs-one'}]});
+  await f.ctx.recordSourceEvent({tenantId:t,sourceId:'cs-root',event:'source_restricted'});
+  await assert.rejects(f.ctx.registerDerivation({tenantId:t,createSources:true,sources:[source('cs-root')],artifacts:[{id:'cs-two',type:'embedding',connectorId:'test-items',storageRef:'test-items/cs-two'}]}),{code:'SOURCE_UNAVAILABLE'});
+  assert.equal((await f.registry.listSources(t))[0]!.status,'revoked');
+});
+test('quarantine hits are buffered, flushed in bulk, counted, and resolvable',async()=>{
+  const t='quarantine-tenant';const run=await f.ctx.beginRun(t,'alice');
+  for(let i=0;i<3;i++)await f.ctx.filterAuthorized({run,candidates:[{artifactId:'unknown-artifact'}],authorize:allow,unregisteredPolicy:'quarantine'});
+  assert.equal((await f.registry.listQuarantine(t)).length,0,'nothing is written on the request path');
+  await f.ctx.flushQuarantine();
+  const entries=await f.registry.listQuarantine(t);
+  assert.equal(entries.length,1);assert.equal(entries[0]!.occurrenceCount,3);assert.equal(entries[0]!.resolvedAt,null);
+  assert.equal(await f.registry.resolveQuarantine(t,[{id:'unknown-artifact'}]),1);
+  assert.equal((await f.registry.listQuarantine(t)).length,0);
+  assert.equal((await f.registry.listQuarantine(t,true))[0]!.resolvedAt!==null,true);
+});
+test('the hot lookup is one round-trip and never leaks tenant context on a reused connection',async()=>{
+  const {createPool}=await import('../packages/core/src/index.js');
+  const single=createPool({host:'127.0.0.1',port:(f.app as any).options.port,user:'contextline_test_app',password:'test_app_local_only',database:'contextline_test',max:1});
+  try{
+    const registry=new (await import('../packages/core/src/index.js')).PostgresRegistry(single);
+    const a='pool-a',b='pool-b';const one=await seed(a,'shared-pool-id'),two=await seed(b,'shared-pool-id');
+    for(let i=0;i<5;i++){
+      assert.equal((await registry.lookupArtifacts(a,[{id:one.artifact.id,version:1}]))[0]!.artifact.tenantId,a);
+      assert.equal((await registry.lookupArtifacts(b,[{id:two.artifact.id,version:1}]))[0]!.artifact.tenantId,b);
+      const guc=await single.query("SELECT nullif(current_setting('app.current_tenant',true),'') AS tenant");
+      assert.equal(guc.rows[0].tenant,null,'the tenant GUC must not survive the statement');
+    }
+  }finally{await single.end();}
+});
+test('the backward lookup has a covering index and the redundant index is gone',async()=>{
+  const indexes=await f.admin.query("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='contextline' AND tablename='dependencies'");
+  const covering=indexes.rows.find(r=>r.indexname==='dependencies_backward_covering');
+  assert.ok(covering);assert.match(covering.indexdef,/INCLUDE \(source_id, source_version\)/);
+  assert.equal(indexes.rows.some(r=>r.indexname==='dependencies_by_artifact'),false);
+});
+test('non-retryable connector faults dead-letter on the first attempt',async()=>{
+  const t='non-retryable-tenant';const root=source('nr-root');
+  await f.ctx.ensureSource(t,root);
+  await f.ctx.registerDerivation({tenantId:t,sources:[root],artifacts:[{id:'nr-artifact',type:'embedding',connectorId:'test-items',storageRef:'unlisted-target/nr-artifact'}]});
+  const event=await f.ctx.recordSourceEvent({tenantId:t,sourceId:root.id,event:'document_deleted'});
+  await worker(t).drain(t);
+  const job=(await f.registry.listJobs(t,event.id))[0]!;
+  assert.equal(job.status,'failed');assert.equal(job.attempts,1);assert.equal(job.lastErrorCode,'UNKNOWN_TABLE');
+  assert.equal((await f.registry.getEvent(t,event.id))?.status,'failed');
+});
+test('heartbeats extend a live lease and stale tokens cannot extend it',async()=>{
+  const t='heartbeat-tenant';const {artifact,roots}=await seed(t);
+  await f.ctx.recordSourceEvent({tenantId:t,sourceId:roots[0]!.id,event:'document_deleted'});
+  await f.registry.materializeNextEvent(t);
+  const job=(await f.registry.claimJobs(t,1,5000))[0]!;
+  assert.equal(await f.registry.heartbeatJob(job,60000),true);
+  const extended=(await f.registry.listJobs(t)).find(j=>j.id===job.id)!;
+  assert.ok(Date.parse(extended.leaseUntil!)>Date.parse(job.leaseUntil!));
+  assert.equal(await f.registry.heartbeatJob({...job,leaseToken:randomUUID()},60000),false);
+  assert.equal(await f.registry.finishJob(job,{status:'completed',verified:true}),true);
+  assert.equal((await f.registry.lookupArtifacts(t,[{id:artifact.id,version:1}]))[0]!.artifact.status,'deleted');
 });

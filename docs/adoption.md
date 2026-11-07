@@ -120,3 +120,16 @@ A useful internal objective is “100% of identified governed serving paths inst
 ## Rollback and removal
 
 Do not roll back by silently allowing unknown artifacts. If the SDK/registry is removed, the application loses this enforcement layer. Keep a governed fallback or disable the affected AI feature. Preserve required audit evidence and lifecycle tombstones according to retention policy.
+
+
+## Copy-paste paths
+
+The five stages now have type-checked reference implementations in [../examples](../examples/README.md):
+ingestion registration, retrieval filtering, cache revalidation, lifecycle events, and memory stores.
+They compile against the real SDK in CI (`npm run typecheck:examples`), so the code you copy is the code
+that is tested.
+
+For estates with existing unregistered artifacts, the path is: deploy with
+`unregisteredPolicy: 'quarantine'` → `contextline-migrate quarantine list` → assign root sources →
+`quarantine backfill` → switch to `deny` once the open manifest is empty. See
+[operations](operations.md).

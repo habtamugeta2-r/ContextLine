@@ -9,7 +9,8 @@ This roadmap is evidence-gated. Items are not commitments or claims of current i
 - [x] Run GitHub Actions end-to-end after push, including live Redis/pgvector and Docker build.
 - [ ] Run the full stack on a Docker/host environment with real connector tables.
 - [ ] Integrate one authoritative customer auth callback and measure revocation-to-denial behavior.
-- [ ] Load test with realistic network, pool contention, auth latency, audit volume, and tenant skew.
+- [x] Blueprint-scale sequential benchmark: 1M dependency rows, 50 tenants, 10,000 measured calls per phase.
+- [ ] Load test with realistic network, pool contention, auth latency, audit volume, tenant skew, and concurrency (including a 4-worker × 200-event soak).
 - [ ] Add latency histograms, oldest-event-age, audit-failure, and auth-callback metrics.
 - [ ] Test backup restore with lifecycle tombstone replay before serving.
 - [ ] Add cross-platform demo bootstrap or documented external-PostgreSQL demo mode.
@@ -19,8 +20,10 @@ This roadmap is evidence-gated. Items are not commitments or claims of current i
 ## Phase 1 — Adoption and coverage tooling
 
 - [ ] Coverage manifest: serving paths × connectors × registered artifacts.
-- [ ] Safe backfill tooling with dry-run, conflict reports, and historical-import review.
+- [x] Quarantine manifest and backfill CLI (`quarantine list/resolve/backfill`) with per-artifact conflict reports.
+- [ ] Backfill dry-run mode and historical-import review workflow.
 - [ ] Orphan detection/reconciliation for registration/publication gaps.
+- [x] Five type-checked adoption-stage examples ([../examples](../examples/README.md)).
 - [ ] Producer instrumentation examples for common ingestion frameworks.
 - [ ] Tenant onboarding automation and dynamic worker configuration.
 - [ ] Policy override inventory and expiry/review workflow.
@@ -39,8 +42,11 @@ This roadmap is evidence-gated. Items are not commitments or claims of current i
 
 ## Phase 3 — Performance and availability
 
-- [ ] Profile and optimize durable audit path; evaluate safe batching/group commit trade-offs.
-- [ ] Optional bounded auth cache with explicit staleness budget and invalidation.
+- [x] Single-round-trip hot read and set-based bulk registration: `filterAuthorized` p95 3.18ms at 1M rows (was 136.87ms at 1K rows).
+- [ ] Profile and optimize the remaining durable audit path; evaluate safe batching/group commit trade-offs.
+- [x] Optional bounded allow-only auth cache (≤30s) with local invalidation.
+- [ ] Cross-instance cache invalidation via PostgreSQL notifications.
+- [ ] Measure the warm-cache gate against a real network authorization service.
 - [ ] Circuit-breaker behavior that preserves fail-closed defaults.
 - [ ] Registry HA/failover drills and connection-budget guidance.
 - [ ] Tenant fairness/quotas and mass-revocation backpressure.

@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { ConnectorError, withTimeout } from './connectors.js';
 import type { StorageConnector } from './connectors.js';
+import { NON_RETRYABLE_CODES, retryDelayMs } from '@contextline/core';
 import type { Diagnostic, LifecycleJob, PostgresRegistry } from '@contextline/core';
 
 export interface WorkerOptions {
@@ -14,6 +15,11 @@ export interface WorkerOptions {
   operationTimeoutMs?: number;
   maxAttempts?: number;
   retryDelaysMs?: number[];
+  /** Blueprint A Part 5: ~10% jitter prevents synchronized retry storms. */
+  retryJitter?: number;
+  eventsPerPass?: number;
+  heartbeatMs?: number;
+  drainTimeoutMs?: number;
   onDiagnostic?: (diagnostic: Diagnostic) => void;
 }
 export class LifecycleWorker {
@@ -24,10 +30,14 @@ export class LifecycleWorker {
   readonly counters = new Map<string,{ processed: number; failures: number; claimed: number }>();
   constructor(options: WorkerOptions) {
     if (!options.tenants.length || options.tenants.length > 100 || new Set(options.tenants).size !== options.tenants.length) throw new Error('Configure 1–100 unique worker tenants');
-    this.options = { batchSize:20,concurrency:4,intervalMs:500,leaseMs:60000,operationTimeoutMs:10000,maxAttempts:6,retryDelaysMs:[1000,5000,30000,300000,1800000],...options };
+    this.options = { batchSize:20,concurrency:4,intervalMs:1000,leaseMs:60000,operationTimeoutMs:10000,maxAttempts:6,retryDelaysMs:[1000,5000,30000,300000,1800000],retryJitter:0.1,eventsPerPass:5,drainTimeoutMs:30000,...options,heartbeatMs:options.heartbeatMs ?? Math.max(100,Math.floor((options.leaseMs ?? 60000)/3)) };
     if (!Number.isInteger(this.options.batchSize) || this.options.batchSize < 1 || this.options.batchSize > 100 || !Number.isInteger(this.options.concurrency) || this.options.concurrency < 1 || this.options.concurrency > 20) throw new Error('Invalid worker batch/concurrency');
     if (this.options.leaseMs <= this.options.operationTimeoutMs*2+1000) throw new Error('Lease must exceed both connector timeouts plus database margin');
     if (!this.options.retryDelaysMs.length || this.options.retryDelaysMs.some(n => !Number.isSafeInteger(n) || n < 0)) throw new Error('Invalid retry delays');
+    if (!(this.options.retryJitter >= 0 && this.options.retryJitter <= 0.5)) throw new Error('Invalid retry jitter');
+    if (!Number.isInteger(this.options.eventsPerPass) || this.options.eventsPerPass < 1 || this.options.eventsPerPass > 20) throw new Error('Invalid eventsPerPass');
+    if (!Number.isInteger(this.options.heartbeatMs) || this.options.heartbeatMs < 100 || this.options.heartbeatMs*2 >= this.options.leaseMs) throw new Error('Heartbeat must be well below the lease');
+    if (!Number.isInteger(this.options.drainTimeoutMs) || this.options.drainTimeoutMs < 1000) throw new Error('Invalid drain timeout');
   }
   start(): void {
     if (this.running) return;
@@ -45,7 +55,17 @@ export class LifecycleWorker {
       }
     })();
   }
-  async stop(): Promise<void> { this.controller?.abort(); await this.running; this.running=null; }
+  /** Stop claiming, then let in-flight work finish within the drain window. */
+  async stop(): Promise<void> {
+    this.controller?.abort();
+    const running = this.running;
+    this.running = null;
+    if (!running) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([running,new Promise<void>(resolve => { timer=setTimeout(() => { this.options.onDiagnostic?.({ code:'WORKER_DRAIN_TIMEOUT',operation:'stop',tenantId:'configured-tenants' }); resolve(); },this.options.drainTimeoutMs); })]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
   /** One bounded scheduling pass; applications may call this directly in tests. */
   async tick(): Promise<number> { return (await this.pass()).processed; }
   async pass(): Promise<{ processed: number; events: number; claimed: number }> {
@@ -58,7 +78,10 @@ export class LifecycleWorker {
     let processed = 0, events = 0, claimed = 0;
     for (const tenantId of tenants) {
       if (!this.counters.has(tenantId)) this.counters.set(tenantId,{ processed:0,failures:0,claimed:0 });
-      if (await this.options.registry.materializeNextEvent(tenantId,this.options.maxAttempts)) events++;
+      for (let i=0;i<this.options.eventsPerPass;i++) {
+        if (!await this.options.registry.materializeNextEvent(tenantId,this.options.maxAttempts)) break;
+        events++;
+      }
       const jobs = await this.options.registry.claimJobs(tenantId,this.options.batchSize,this.options.leaseMs);
       claimed += jobs.length;
       this.counters.get(tenantId)!.claimed += jobs.length;
@@ -84,12 +107,18 @@ export class LifecycleWorker {
     let errorCode: string | undefined;
     let verified = false;
     const counters = this.counters.get(job.tenantId)!;
+    // Blueprint A Part 5: extend the lease while the connector call is genuinely running,
+    // so a slow-but-alive worker is not reclaimed and a killed one still is.
+    const heartbeat = setInterval(() => {
+      void this.options.registry.heartbeatJob(job,this.options.leaseMs).catch(() => undefined);
+    },this.options.heartbeatMs);
+    heartbeat.unref?.();
     try {
       if (job.action === 'flag') result='pending_review';
       else {
         const connector = this.options.connectors[job.connectorId];
         if (!connector) throw new ConnectorError('CONNECTOR_NOT_CONFIGURED');
-        const context = { tenantId:job.tenantId };
+        const context = { tenantId:job.tenantId,artifactType:job.artifactType };
         if (job.action === 'delete') await withTimeout(connector.delete(job.storageRef,context),this.options.operationTimeoutMs);
         else await withTimeout(connector.invalidate(job.storageRef,context),this.options.operationTimeoutMs);
         verified = await withTimeout(connector.verify(job.storageRef,context,job.action === 'delete'?'deleted':'invalidated'),this.options.operationTimeoutMs);
@@ -97,10 +126,11 @@ export class LifecycleWorker {
       }
     } catch (error) {
       errorCode = error instanceof ConnectorError ? error.code : 'CONNECTOR_ERROR';
-      result = job.attempts >= job.maxAttempts ? 'failed' : 'retry';
+      // Configuration faults can never succeed on retry: dead-letter immediately.
+      result = NON_RETRYABLE_CODES.has(errorCode) || job.attempts >= job.maxAttempts ? 'failed' : 'retry';
       counters.failures++;
-    }
-    const delayMs = result === 'retry' ? this.options.retryDelaysMs[Math.min(job.attempts-1,this.options.retryDelaysMs.length-1)] : 0;
+    } finally { clearInterval(heartbeat); }
+    const delayMs = result === 'retry' ? retryDelayMs(job.attempts,this.options.retryDelaysMs,this.options.retryJitter) : 0;
     const committed = await this.options.registry.finishJob(job,{ status:result,errorCode,verified,delayMs });
     if (committed && result === 'completed') counters.processed++;
     return committed;
@@ -113,7 +143,12 @@ export class LifecycleWorker {
       const t = tenant.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n');
       samples.push(`contextline_queue_jobs{tenant="${t}"} ${stats.pending}`,`contextline_dead_letter_jobs{tenant="${t}"} ${stats.failed}`,`contextline_review_jobs{tenant="${t}"} ${stats.review}`);
     }
-    const types = ['contextline_worker_up gauge','contextline_jobs_processed_total counter','contextline_job_failures_total counter','contextline_jobs_claimed_total counter','contextline_queue_jobs gauge','contextline_dead_letter_jobs gauge','contextline_review_jobs gauge'];
+    for (const [id,connector] of Object.entries(this.options.connectors)) {
+      let healthy = false;
+      try { healthy = (await withTimeout(connector.healthCheck(),this.options.operationTimeoutMs)).healthy; } catch { healthy = false; }
+      samples.push(`contextline_connector_healthy{connector="${id.replace(/[^a-z0-9_-]/gi,'_')}"} ${healthy?1:0}`);
+    }
+    const types = ['contextline_connector_healthy gauge','contextline_worker_up gauge','contextline_jobs_processed_total counter','contextline_job_failures_total counter','contextline_jobs_claimed_total counter','contextline_queue_jobs gauge','contextline_dead_letter_jobs gauge','contextline_review_jobs gauge'];
     return types.map(t=>`# TYPE ${t}`).join('\n')+'\n'+samples.join('\n')+'\n';
   }
 }

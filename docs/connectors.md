@@ -46,12 +46,12 @@ const memory = new PostgresTableConnector(pool, {
 Storage references are `configuredTableKey/rowId`, for example `summaries/summary-42`. The key selects an operator allowlist entry; the row ID is a parameter. SQL identifiers must match `^[a-z][a-z0-9_]{0,62}$`. Unknown keys and extra path segments are rejected.
 
 - `delete`: `DELETE ... WHERE idColumn=$1 AND tenantColumn=$2`.
-- `invalidate`: set configured status column to `stale`; requires `statusColumn`.
+- `invalidate`: set the configured status column to `stale`, or to `pending_review` when the artifact type is `memory` (the worker passes `artifactType` in the context). Requires `statusColumn`.
 - `verify(deleted)`: no matching tenant/ID row.
-- `verify(invalidated)`: row absent or status exactly `stale`.
+- `verify(invalidated)`: row absent, or status exactly `stale` / `pending_review`.
 - `healthCheck`: bounded `SELECT 1 ... LIMIT 0` against configured tables.
 
-The application must ensure its retrieval paths respect `stale` or, preferably, pass every candidate through ContextLine regardless of storage status. The connector does not rewrite application queries.
+The application must ensure its retrieval paths respect `stale` and `pending_review` or, preferably, pass every candidate through ContextLine regardless of storage status. The connector does not rewrite application queries.
 
 ## 3. pgvector
 
@@ -84,15 +84,15 @@ const answers = new RedisConnector(client); // tenant prefix required by default
 Default isolation requires the key to start with the exact context tenant ID followed by `:`. This prevents a tenant A registration from naming tenant B's key. If you use a physically separate Redis client/store per tenant, you may explicitly set `requireTenantPrefix: false`; document that boundary and test it.
 
 - `delete`: `DEL`, idempotent.
-- `invalidate`: an atomic Lua script checks existence, then `SET ... KEEPTTL` with the reserved tombstone below. It does not resurrect a missing key or extend its lifetime.
+- `invalidate` **deletes the key by default** (blueprint A: Redis has no soft invalidation, and absence is the only provable state). Pass `{ invalidationMode: 'tombstone' }` to opt into the previous behavior: an atomic Lua script checks existence, then `SET ... KEEPTTL` with the reserved tombstone below. It does not resurrect a missing key or extend its lifetime.
 - `verify(deleted)`: `GET` returns null.
-- `verify(invalidated)`: null or the exact tombstone.
+- `verify(invalidated)`: null, or the exact tombstone when tombstone mode is explicitly enabled.
 
 ```json
 {"contextline":{"invalidated":true,"version":1}}
 ```
 
-Use dedicated string-valued cache keys. Applying the tombstone to a hash/list/stream is unsupported and will fail rather than silently corrupting semantics. `KEEPTTL` requires Redis 6+. The application must treat the tombstone as a cache miss even if it bypasses ContextLine. TTL preservation is covered by the live test path.
+Tombstone mode is a deliberate deviation from the blueprint, kept for customers who want a poison value rather than a miss. Use dedicated string-valued cache keys. Applying the tombstone to a hash/list/stream is unsupported and will fail rather than silently corrupting semantics. `KEEPTTL` requires Redis 6+. The application must treat the tombstone as a cache miss even if it bypasses ContextLine. TTL preservation is covered by the live test path.
 
 Redis replicas, persistence, eviction, and failover can affect verification. Verify against the authoritative endpoint used for serving; do not assume a lagging replica proves deletion. A reused key after deletion is a new publication and needs a new artifact version/provenance.
 
@@ -126,7 +126,8 @@ Custom connectors are registered programmatically through `LifecycleWorker({ con
 | `UNKNOWN_TABLE` | Reference names a table key outside the allowlist | Fix storage reference or configuration |
 | `INVALID_STORAGE_REFERENCE` | Malformed path/key | Fix producer instrumentation |
 | `TENANT_PREFIX_REQUIRED` | Redis key does not match tenant boundary | Fix key naming; do not disable isolation casually |
-| `INVALIDATION_NOT_SUPPORTED` | PostgreSQL table lacks a status column | Configure status or use deletion policy |
+| `INVALIDATION_NOT_SUPPORTED` | A connector cannot invalidate (pgvector without a status column falls back to deletion instead) | Configure a status column or use deletion |
+| `INVALID_CONNECTOR_CONFIGURATION` | Unknown connector option, e.g. an unsupported Redis invalidation mode | Fix the configuration |
 | `CONNECTOR_ERROR` | Other connector failure, sanitized | Inspect private service logs; retry/dead-letter workflow applies |
 
 ## 7. Adding a connector
@@ -139,3 +140,27 @@ Custom connectors are registered programmatically through `LifecycleWorker({ con
 6. Register it in the worker and instrument producers with the exact connector ID/reference format.
 
 Pinecone, Qdrant, Weaviate, Milvus, Chroma, object stores, MongoDB, DynamoDB, and search indexes are roadmap adapters, not shipped implementations. Do not claim coverage merely because the interface could support them.
+
+
+## Storage reference forms
+
+The canonical form is `connector:target:record`, parsed by `parseStorageRef` in the core package:
+
+| Form | Example | Notes |
+|---|---|---|
+| Canonical | `pgvector:chunks:chunk-42` | Connector kind must match the connector instance |
+| Canonical, Redis | `redis:answers:acme:answer:9f3a` | The record ID keeps its colons; the tenant prefix is still required |
+| Legacy target/record | `demo-chunks/chunk-42` | Still accepted; unchanged registrations keep working |
+| Bare record | `chunk-42` | pgvector single-table convenience |
+| Legacy Redis key | `acme:answer:9f3a` | Tenant-prefix check still applies |
+
+Only the first two separators are structural, so record IDs may contain colons. Control characters,
+empty segments, and references over 1024 characters are rejected before any database call.
+
+## Invalidation fallbacks
+
+- **pgvector without a status column:** `invalidate` performs a delete and `verify` checks absence. The
+  registry still records the artifact as `stale`, so operators can see the intended action; the physical
+  row is gone. Configure a status column if you need soft invalidation.
+- **Agent memory in a generic table:** invalidation writes `pending_review`, not `stale`, because memory
+  may hold synthesized multi-source knowledge that needs a human decision.

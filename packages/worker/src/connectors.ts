@@ -1,7 +1,8 @@
 import type { Pool } from 'pg';
-import type { LifecycleAction } from '@contextline/core';
+import { parseStorageRef } from '@contextline/core';
+import type { ArtifactType, LifecycleAction } from '@contextline/core';
 
-export interface ConnectorContext { tenantId: string }
+export interface ConnectorContext { tenantId: string; artifactType?: ArtifactType | undefined }
 export interface StorageConnector {
   readonly type: string;
   delete(storageRef: string, context: ConnectorContext): Promise<void>;
@@ -28,15 +29,21 @@ export class PostgresTableConnector implements StorageConnector {
     }));
     if (!this.tables.size) throw new ConnectorError('INVALID_TABLE_CONFIGURATION');
   }
+  /** Accepts canonical `connector:target:record` and legacy `target/record`. */
   protected target(ref: string): { table: ResolvedTable; id: string } {
-    const split = ref.indexOf('/');
-    if (split < 1 || split === ref.length-1 || ref.length > 1024 || /[\u0000-\u001f]/.test(ref)) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
-    const key = ref.slice(0,split), id = ref.slice(split+1);
+    let parsed;
+    try { parsed = parseStorageRef(ref); } catch { throw new ConnectorError('INVALID_STORAGE_REFERENCE'); }
+    const canonical = parsed.connector !== null && this.kinds.includes(parsed.connector);
+    const key = canonical ? parsed.target : parsed.connector === null ? parsed.target : null;
+    const id = canonical ? parsed.recordId : parsed.connector === null && parsed.target !== null ? parsed.recordId : ref;
+    if (!key || !id) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
     const table = this.tables.get(key);
-    if (!id || id.includes('/')) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
     if (!table) throw new ConnectorError('UNKNOWN_TABLE');
     return { table,id };
   }
+  protected get kinds(): string[] { return ['postgres','postgres-table']; }
+  /** Memory carries synthesized knowledge: flag it for a human instead of marking stale. */
+  protected invalidStatus(context: ConnectorContext): string { return context.artifactType === 'memory' ? 'pending_review' : 'stale'; }
   private qualified(table: ResolvedTable): string { return `"${table.schema}"."${table.table}"`; }
   async delete(ref: string, context: ConnectorContext): Promise<void> {
     const { table,id } = this.target(ref);
@@ -45,14 +52,14 @@ export class PostgresTableConnector implements StorageConnector {
   async invalidate(ref: string, context: ConnectorContext): Promise<void> {
     const { table,id } = this.target(ref);
     if (!table.statusColumn) throw new ConnectorError('INVALIDATION_NOT_SUPPORTED');
-    await this.pool.query(`UPDATE ${this.qualified(table)} SET "${table.statusColumn}"='stale' WHERE "${table.idColumn}"=$1 AND "${table.tenantColumn}"=$2`,[id,context.tenantId]);
+    await this.pool.query(`UPDATE ${this.qualified(table)} SET "${table.statusColumn}"=$3 WHERE "${table.idColumn}"=$1 AND "${table.tenantColumn}"=$2`,[id,context.tenantId,this.invalidStatus(context)]);
   }
   async verify(ref: string, context: ConnectorContext, expected: 'deleted' | 'invalidated'): Promise<boolean> {
     const { table,id } = this.target(ref);
     const columns = expected === 'invalidated' && table.statusColumn ? `"${table.statusColumn}"` : '1';
     const result = await this.pool.query(`SELECT ${columns} FROM ${this.qualified(table)} WHERE "${table.idColumn}"=$1 AND "${table.tenantColumn}"=$2`,[id,context.tenantId]);
     if (!result.rowCount) return true;
-    return expected === 'invalidated' && !!table.statusColumn && result.rows[0][table.statusColumn] === 'stale';
+    return expected === 'invalidated' && !!table.statusColumn && ['stale','pending_review'].includes(result.rows[0][table.statusColumn]);
   }
   async healthCheck(): Promise<{ healthy: boolean; latencyMs: number }> {
     const start = performance.now();
@@ -64,11 +71,29 @@ export class PostgresTableConnector implements StorageConnector {
 }
 export class PgVectorConnector extends PostgresTableConnector {
   override readonly type = 'pgvector';
-  constructor(pool: Pool, table: Omit<TableConfig,'statusColumn'>) { super(pool,{ pgvector:table }); }
-  // PgVector refs are bare row IDs, not user-supplied SQL or table names.
+  private readonly hasStatusColumn: boolean;
+  constructor(pool: Pool, table: TableConfig) { super(pool,{ pgvector:table }); this.hasStatusColumn = !!table.statusColumn; }
+  protected override get kinds(): string[] { return ['pgvector']; }
+  // Bare row IDs remain valid; `pgvector:target:record` is the canonical form.
   protected override target(ref: string): { table: ResolvedTable; id: string } {
-    if (!ref || ref.includes('/') || /[\u0000-\u001f]/.test(ref)) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
+    let parsed;
+    try { parsed = parseStorageRef(ref); } catch { throw new ConnectorError('INVALID_STORAGE_REFERENCE'); }
+    if (parsed.connector === 'pgvector') {
+      if (!parsed.recordId) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
+      return super.target(parsed.target ? `pgvector:${parsed.target}:${parsed.recordId}` : `pgvector/${parsed.recordId}`);
+    }
+    if (parsed.connector !== null) return super.target(`pgvector/${ref}`);
+    if (!ref || ref.includes('/')) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
     return super.target(`pgvector/${ref}`);
+  }
+  /** Blueprint A Part 4: without a status column, invalidation falls back to deletion. */
+  override async invalidate(ref: string, context: ConnectorContext): Promise<void> {
+    if (!this.hasStatusColumn) return this.delete(ref,context);
+    return super.invalidate(ref,context);
+  }
+  override async verify(ref: string, context: ConnectorContext, expected: 'deleted' | 'invalidated'): Promise<boolean> {
+    if (!this.hasStatusColumn) return super.verify(ref,context,'deleted');
+    return super.verify(ref,context,expected);
   }
 }
 
@@ -83,17 +108,33 @@ const INVALIDATE_SCRIPT = "if redis.call('EXISTS', KEYS[1]) == 1 then return red
 export class RedisConnector implements StorageConnector {
   readonly type = 'redis';
   private readonly requireTenantPrefix: boolean;
-  constructor(private readonly client: RedisLike, options: { requireTenantPrefix?: boolean } = {}) { this.requireTenantPrefix = options.requireTenantPrefix ?? true; }
+  private readonly invalidationMode: 'delete' | 'tombstone';
+  constructor(private readonly client: RedisLike, options: { requireTenantPrefix?: boolean; invalidationMode?: 'delete' | 'tombstone' } = {}) {
+    this.requireTenantPrefix = options.requireTenantPrefix ?? true;
+    this.invalidationMode = options.invalidationMode ?? 'delete';
+    if (!['delete','tombstone'].includes(this.invalidationMode)) throw new ConnectorError('INVALID_CONNECTOR_CONFIGURATION');
+  }
   private key(ref: string, context: ConnectorContext): string {
-    if (!ref || ref.length > 1024 || /[\u0000-\u001f]/.test(ref)) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
-    if (this.requireTenantPrefix && (!context.tenantId || !ref.startsWith(`${context.tenantId}:`))) throw new ConnectorError('TENANT_PREFIX_REQUIRED');
-    return ref;
+    // Canonical `redis:target:key` and legacy tenant-prefixed keys are both accepted.
+    let key = ref;
+    if (ref.startsWith('redis:')) {
+      const rest = ref.slice(6), split = rest.indexOf(':');
+      key = split > 0 ? rest.slice(split+1) : rest;
+    }
+    if (!key || key.length > 1024 || /[\u0000-\u001f]/.test(key)) throw new ConnectorError('INVALID_STORAGE_REFERENCE');
+    if (this.requireTenantPrefix && (!context.tenantId || !key.startsWith(`${context.tenantId}:`))) throw new ConnectorError('TENANT_PREFIX_REQUIRED');
+    return key;
   }
   async delete(ref: string, context: ConnectorContext): Promise<void> { await this.client.del(this.key(ref,context)); }
-  async invalidate(ref: string, context: ConnectorContext): Promise<void> { await this.client.eval(INVALIDATE_SCRIPT,1,this.key(ref,context),REDIS_INVALIDATION_TOMBSTONE); }
+  /** Blueprint A: Redis has no soft invalidation. Tombstones are an explicit opt-in. */
+  async invalidate(ref: string, context: ConnectorContext): Promise<void> {
+    const key = this.key(ref,context);
+    if (this.invalidationMode === 'delete') { await this.client.del(key); return; }
+    await this.client.eval(INVALIDATE_SCRIPT,1,key,REDIS_INVALIDATION_TOMBSTONE);
+  }
   async verify(ref: string, context: ConnectorContext, expected: 'deleted' | 'invalidated'): Promise<boolean> {
     const value = await this.client.get(this.key(ref,context));
-    return value === null || (expected === 'invalidated' && value === REDIS_INVALIDATION_TOMBSTONE);
+    return value === null || (expected === 'invalidated' && this.invalidationMode === 'tombstone' && value === REDIS_INVALIDATION_TOMBSTONE);
   }
   async healthCheck(): Promise<{ healthy: boolean; latencyMs: number }> {
     const start = performance.now();

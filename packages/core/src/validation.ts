@@ -32,12 +32,13 @@ export function uniqueBy<T>(items: T[], key: (item: T) => string): T[] {
 }
 export function validateRegistration(input: RegisterDerivationInput): void {
   identifier(input.tenantId, 'tenant ID'); boundedArray(input.sources, 'sources', 100, !!input.derivedFrom?.length);
-  boundedArray(input.artifacts, 'artifacts', 100);
+  boundedArray(input.artifacts, 'artifacts', 500);
   input.sources.forEach(sourceRef);
   for (const a of input.artifacts) {
     artifactRef(a); identifier(a.connectorId, 'connector ID', 64);
     if (!/^[a-z0-9][a-z0-9_-]*$/.test(a.connectorId)) throw new ContextLineError('INVALID_IDENTIFIER', 'connector ID must be a lowercase configured name');
     identifier(a.storageRef, 'storage reference', 1024);
+    if (a.ownerPrincipal !== undefined) identifier(a.ownerPrincipal, 'owner principal', 512);
     if (!['embedding', 'cache', 'summary', 'memory', 'other'].includes(a.type)) throw new ContextLineError('INVALID_TYPE', 'Unknown artifact type');
   }
   if (uniqueBy(input.artifacts, artifactKey).length !== input.artifacts.length) throw new ContextLineError('DUPLICATE_ARTIFACT', 'Duplicate artifact version in registration');
@@ -59,12 +60,13 @@ export function validateEvent(input: SourceEventInput): void {
   if (input.event === 'document_updated' ? input.newVersion === undefined : input.newVersion !== undefined) throw new ContextLineError('INVALID_VERSION', 'newVersion is required only for document_updated');
   if (input.idempotencyKey !== undefined) identifier(input.idempotencyKey, 'idempotency key', 128);
   if (input.memoryAction !== undefined && !['flag', 'invalidate', 'delete'].includes(input.memoryAction)) throw new ContextLineError('INVALID_ACTION', 'Unknown memory action');
-  if (input.memoryAction && input.event !== 'source_restricted') throw new ContextLineError('INVALID_ACTION', 'memoryAction applies only to source_restricted');
+  if (input.memoryAction && !['source_restricted','retention_expired','permission_revoked'].includes(input.event)) throw new ContextLineError('INVALID_ACTION', 'memoryAction applies only to restriction, retention, and principal-scoped revocation');
 }
 export function validateEnforcement(options: EnforcementOptions): void {
   if (typeof options.authorize !== 'function') throw new ContextLineError('INVALID_CALLBACK', 'authorize must be a function');
   if (options.unregisteredPolicy && !['deny', 'allow', 'quarantine'].includes(options.unregisteredPolicy)) throw new ContextLineError('INVALID_POLICY', 'Unknown unregisteredPolicy');
   if (options.onError && !['deny', 'allow', 'skip'].includes(options.onError)) throw new ContextLineError('INVALID_POLICY', 'Unknown onError');
+  if (options.authorizeMode && !['batch','per-source'].includes(options.authorizeMode)) throw new ContextLineError('INVALID_POLICY', 'Unknown authorizeMode');
   if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 30000)) throw new ContextLineError('INVALID_TIMEOUT', 'timeoutMs must be 1–30000');
 }
 export function validateArtifact(input: ArtifactRegistration): void {

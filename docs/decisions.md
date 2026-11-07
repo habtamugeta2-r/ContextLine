@@ -85,3 +85,53 @@ These records explain consequential choices and their trade-offs. They are not c
 **Context:** A SaaS control plane adds tenancy, SSO, billing, and operational risk before the core loop is validated.  
 **Decision:** Ship SDK/registry/worker/configuration and a local demo. Defer hosted control plane until design partners prove repeated need and buying intent.  
 **Consequences:** Tenant lists and connector config are deployment-managed. Dynamic discovery and centralized administration are future work.
+
+
+## ADR-015: The hot read is a security-invoker function, not a set_config CTE
+
+**Context:** Blueprint A requires one round-trip per request with the tenant set inside the same
+statement. The obvious implementation — `WITH ctx AS MATERIALIZED (SELECT set_config(...)) SELECT ...` —
+silently returns **zero rows**: PostgreSQL evaluates the RLS qual as a one-time filter *before* the CTE
+executes. This was reproduced with `EXPLAIN ANALYZE` and is recorded in migration 002.
+**Decision:** The backward lookup is a `SECURITY INVOKER` plpgsql function that sets the GUC, then runs
+the query under the caller's own policies, with `search_path FROM CURRENT` so custom schemas work.
+Cold reads (UI, audit, operator tooling) keep transaction-local `SET LOCAL`.
+**Consequences:** One round-trip and RLS together; the function is part of the migration surface and its
+signature is granted explicitly to the runtime role. A GUC failure can only under-return rows because
+every query also filters by tenant explicitly.
+
+## ADR-016: Blueprint precedence is explicit, and safety invariants outrank it
+
+**Context:** Three blueprint passes disagree on batching, Redis invalidation, artifact re-registration,
+and principal-scoped revocation. One pass would resurrect deleted artifacts via
+`ON CONFLICT DO UPDATE SET status='active'`; another would leave revoked Redis content readable for 60s.
+**Decision:** The Revised pass governs; where any pass contradicts a proven security invariant, the
+invariant wins and the conflict is recorded with a rationale.
+**Consequences:** [blueprint-conflicts](blueprint-conflicts.md) is the audit trail for every disagreement;
+[conformance](conformance.md) states met/partial/deviation/deferred per requirement.
+
+## ADR-017: Principal-scoped events carry ownership, not just audit
+
+**Context:** The Revised blueprint requires one user's revocation to invalidate only that user's cache
+and memory. Audit-only handling left stale personal derivatives in storage.
+**Decision:** Artifacts may record an opaque `owner_principal`; events carry `scope`. Principal-scoped
+events create jobs only for that principal's active cache and memory, never shared embeddings.
+**Consequences:** Customers must pass `ownerPrincipal` for personal derivatives to get scoped cleanup.
+Without it, principal revocation still blocks serving immediately but cannot target storage.
+
+## ADR-018: Bulk writes are set-based, and identity stays immutable
+
+**Context:** Row-by-row registration made ingestion thousands of round-trips. A blueprint pass suggested
+upserting artifacts back to `active` on conflict.
+**Decision:** Registration issues at most three `unnest`-based writes (optional sources, artifacts,
+dependencies) plus two set-based reads, all in one transaction. Conflicts are `DO NOTHING`; an exact
+retry is a no-op and changed content requires a new version.
+**Consequences:** 500-artifact batches; ~4,246 artifacts/s locally. Tombstones can never be resurrected.
+
+## ADR-019: Latency gates are published with their measurement limits
+
+**Context:** The blueprint sets p95 gates at 2ms lookup, 5ms end to end, 2.5ms warm cache.
+**Decision:** Publish all three with the actual numbers. The first two are met at 1M rows; the warm-cache
+gate is not, because a zero-latency synthetic callback gives the cache nothing to remove while the durable
+audit write remains. The nightly workflow enforces the first two and reports the third.
+**Consequences:** No gate is silently dropped or redefined. The tail (max 36ms) is published alongside p95.

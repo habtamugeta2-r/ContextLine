@@ -91,7 +91,7 @@ The job workflow completes, the reviewer is recorded, and the artifact remains `
 ### Authorization service unavailable
 
 **Symptoms:** `authorization_timeout`/`authorization_error` decisions.  
-**Action:** check the authoritative service and callback mapping. Keep fail-closed defaults. Fail-open is an explicit risk decision, not an automatic recovery tactic. There is no auth cache/circuit breaker in v0.1.0.
+**Action:** check the authoritative service and callback mapping. Keep fail-closed defaults. Fail-open is an explicit risk decision, not an automatic recovery tactic. The auth cache is opt-in and disabled by default; there is no circuit breaker yet.
 
 ### Worker down
 
@@ -149,3 +149,69 @@ Do not remove `postmaster.pid` while a server is alive. Logs are in `.contextlin
 - Roll out SDK changes canary-style with deny/quarantine telemetry.
 - Record security-policy overrides and review them periodically.
 - Keep the demo, test credentials, and local database directories out of production images and secrets stores.
+
+
+## Quarantine backfill CLI
+
+```bash
+export CONTEXTLINE_DATABASE_URL=postgresql://contextline_app:...@db/app   # runtime role
+contextline-migrate quarantine list --tenant acme            # open manifest rows, JSON
+contextline-migrate quarantine list --tenant acme --all      # include resolved
+contextline-migrate quarantine backfill --tenant acme --file mappings.json
+contextline-migrate quarantine resolve --tenant acme --artifact answer:123@1
+```
+
+`mappings.json`:
+
+```json
+[
+  {
+    "artifactId": "answer:123",
+    "artifactVersion": 1,
+    "type": "cache",
+    "connectorId": "redis",
+    "storageRef": "redis:answers:acme:answer:123",
+    "ownerPrincipal": "usr_8f21",
+    "sources": [{ "id": "doc:q3-revenue", "version": 1 }]
+  }
+]
+```
+
+Backfill goes through the same immutable, race-checked registration path as ingestion, then marks the
+manifest rows resolved. Failures are reported per artifact with a stable error code and a nonzero exit
+status; nothing is silently skipped. Move `unregisteredPolicy` from `quarantine` to `deny` only when the
+open manifest is empty for that tenant.
+
+## Worker metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `contextline_worker_up` | gauge | The worker loop is running |
+| `contextline_jobs_processed_total` | counter | Verified completions |
+| `contextline_job_failures_total` | counter | Failed attempts, including retries |
+| `contextline_jobs_claimed_total` | counter | Claims taken |
+| `contextline_queue_jobs` | gauge | Pending/processing/retry jobs |
+| `contextline_dead_letter_jobs` | gauge | Exhausted or non-retryable jobs — **alert on this** |
+| `contextline_review_jobs` | gauge | Jobs awaiting a human decision |
+| `contextline_connector_healthy` | gauge | Last connector health check, per connector |
+
+Alert guidance: `contextline_dead_letter_jobs > 0` pages immediately (a revocation did not propagate);
+`contextline_connector_healthy == 0` warns before jobs start failing; a growing `contextline_queue_jobs`
+with a flat processed counter means the worker is stuck or under-provisioned.
+
+## Worker timing defaults
+
+| Setting | Default | Notes |
+|---|---|---|
+| `intervalMs` | 1000 | Idle tick |
+| `eventsPerPass` | 5 | Events materialized per tenant per pass |
+| `batchSize` / `concurrency` | 20 / 4 | Jobs claimed / connector calls in flight |
+| `leaseMs` | 60000 | A killed worker's jobs are reclaimable after this |
+| `heartbeatMs` | lease/3 (20000 at the default lease) | Extends the lease while a call is genuinely running |
+| `retryDelaysMs` | 1s, 5s, 30s, 5m, 30m | With ±10% jitter (`retryJitter`) |
+| `maxAttempts` | 6 | Initial attempt plus five retries, then dead letter |
+| `drainTimeoutMs` | 30000 | Stop claims, finish in-flight work, then exit |
+
+Configuration faults (`UNKNOWN_TABLE`, `INVALID_STORAGE_REFERENCE`, `CONNECTOR_NOT_CONFIGURED`,
+`TENANT_PREFIX_REQUIRED`, `INVALID_TABLE_CONFIGURATION`, `INVALIDATION_NOT_SUPPORTED`) dead-letter on the
+**first** attempt: retrying a misconfiguration only delays the alert.

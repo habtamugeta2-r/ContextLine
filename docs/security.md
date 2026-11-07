@@ -53,7 +53,7 @@ Invalid API inputs, duplicate candidates, oversized batches, and mismatched run 
 - `allowOutdatedVersions: true` relaxes freshness only. Deleted/revoked/expired roots still deny.
 - `auditPolicy: "best_effort"` permits otherwise authorized content when audit persistence fails. Use only with an explicit risk acceptance and external monitoring.
 
-There is no SDK authorization-result cache in v0.1.0. Every enforcement call invokes the callback for its unique eligible roots. This avoids introducing a second stale-permission window. A future cache must define bounded staleness and cross-process invalidation before being enabled.
+Since v0.2.0 an **opt-in** allow-only authorization cache exists and is **disabled by default**. With it disabled, every enforcement call invokes the callback for its unique eligible roots, so there is no second stale-permission window. See the exact staleness contract below before enabling it.
 
 ## 4. Tenant isolation
 
@@ -145,3 +145,27 @@ A precise questionnaire response for an integrated deployment is:
 > “Governed AI artifacts are registered against versioned root sources. Before retrieval or cache serving, the application checks artifact/root lifecycle state and obtains current authorization for every root from our authoritative service. Unknown provenance and authorization failures are denied by default. Source lifecycle events create durable propagation jobs; configured connectors delete or invalidate derivatives and verify the resulting storage state. Access decisions and lifecycle outcomes are recorded for audit. Coverage is limited to instrumented paths and registered stores; backups, model weights, and downstream copies are handled by separate controls.”
 
 Attach the actual connector inventory, coverage report, test results, retention policy, and incident runbook. Do not claim universal protection or compliance from the existence of this repository alone.
+
+
+## Optional authorization cache — exact staleness contract
+
+The cache is **off by default**. When enabled:
+
+- only `true` results are stored, so a stale entry can only over-serve within the TTL, never over-block;
+- the TTL is validated at construction and hard-capped at **30 seconds**;
+- keys are `(tenant, principal, source)`, so one principal's allow never serves another;
+- `recordSourceEvent` purges that source **in the local process only**; other processes converge at the
+  TTL. Cross-instance purge is deferred;
+- registry lifecycle state (artifact status, source status, currency) is read fresh on every call, so a
+  cached allow can never override a revoked, deleted, expired, or outdated source.
+
+If your revocation SLO is tighter than 30 seconds across processes, leave the cache disabled. The
+blueprint's warm-cache latency gate is not met in the local benchmark; see [validation](validation.md)
+for why that measurement cannot show a benefit against a zero-latency synthetic callback.
+
+## Principal-scoped cleanup
+
+Personal cache and memory artifacts should be registered with an opaque `ownerPrincipal`. A
+principal-scoped revocation then deletes that principal's cached answers and flags their memory for
+review, while shared embeddings and summaries are untouched. Without an owner, serving is still blocked
+immediately, but the worker cannot target that principal's storage.

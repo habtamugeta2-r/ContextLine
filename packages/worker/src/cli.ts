@@ -15,7 +15,7 @@ let server:ReturnType<typeof createServer>|null=null;
 let worker:LifecycleWorker|undefined;
 try {
   const file=required('CONTEXTLINE_CONNECTORS_FILE');const raw=await readFile(file,'utf8');if(raw.length>65536)throw new Error('Connector config too large');
-  const config=JSON.parse(raw) as {connectors:{id:string;type:string;table?:string;schema?:string;idColumn?:string;tenantColumn?:string;statusColumn?:string;requireTenantPrefix?:boolean;tables?:Record<string,TableConfig>}[]};
+  const config=JSON.parse(raw) as {connectors:{id:string;type:string;table?:string;schema?:string;idColumn?:string;tenantColumn?:string;statusColumn?:string;requireTenantPrefix?:boolean;invalidationMode?:'delete'|'tombstone';tables?:Record<string,TableConfig>}[]};
   if(!Array.isArray(config.connectors)||!config.connectors.length||config.connectors.length>100)throw new Error('Invalid connectors array');
   const connectors:Record<string,StorageConnector>={};
   for(const entry of config.connectors){
@@ -23,11 +23,11 @@ try {
     if(entry.type==='redis'){
       const client=new Redis(required('REDIS_URL'),{maxRetriesPerRequest:1,enableOfflineQueue:false,connectTimeout:5000});
       client.on('error',()=>console.error(JSON.stringify({level:'error',code:'REDIS_CONNECTION_ERROR'})));
-      redisClients.push(client);connectors[entry.id]=new RedisConnector(client,{requireTenantPrefix:entry.requireTenantPrefix ?? true});
+      redisClients.push(client);connectors[entry.id]=new RedisConnector(client,{requireTenantPrefix:entry.requireTenantPrefix ?? true,invalidationMode:entry.invalidationMode ?? 'delete'});
     }else if(entry.type==='pgvector'){
       if(!entry.table)throw new Error('pgvector connector requires table');
       const table:TableConfig={table:entry.table};
-      if(entry.schema!==undefined)table.schema=entry.schema;if(entry.idColumn!==undefined)table.idColumn=entry.idColumn;if(entry.tenantColumn!==undefined)table.tenantColumn=entry.tenantColumn;
+      if(entry.schema!==undefined)table.schema=entry.schema;if(entry.idColumn!==undefined)table.idColumn=entry.idColumn;if(entry.tenantColumn!==undefined)table.tenantColumn=entry.tenantColumn;if(entry.statusColumn!==undefined)table.statusColumn=entry.statusColumn;
       connectors[entry.id]=new PgVectorConnector(pool,table);
     }else if(entry.type==='postgres'){
       if(!entry.tables)throw new Error('postgres connector requires tables');connectors[entry.id]=new PostgresTableConnector(pool,entry.tables);
@@ -35,7 +35,7 @@ try {
   }
   const tenants=required('CONTEXTLINE_WORKER_TENANTS').split(',').map(t=>t.trim()).filter(Boolean);
   const registry=new PostgresRegistry(pool,{schema:process.env.CONTEXTLINE_SCHEMA ?? 'contextline'});
-  worker=new LifecycleWorker({registry,connectors,tenants,batchSize:integer('CONTEXTLINE_BATCH_SIZE',20),concurrency:integer('CONTEXTLINE_CONCURRENCY',4),intervalMs:integer('CONTEXTLINE_INTERVAL_MS',500),leaseMs:integer('CONTEXTLINE_LEASE_MS',60000),operationTimeoutMs:integer('CONTEXTLINE_OPERATION_TIMEOUT_MS',10000),maxAttempts:integer('CONTEXTLINE_MAX_ATTEMPTS',6),onDiagnostic:d=>console.error(JSON.stringify({level:'error',...d}))});
+  worker=new LifecycleWorker({registry,connectors,tenants,batchSize:integer('CONTEXTLINE_BATCH_SIZE',20),concurrency:integer('CONTEXTLINE_CONCURRENCY',4),intervalMs:integer('CONTEXTLINE_INTERVAL_MS',1000),leaseMs:integer('CONTEXTLINE_LEASE_MS',60000),operationTimeoutMs:integer('CONTEXTLINE_OPERATION_TIMEOUT_MS',10000),maxAttempts:integer('CONTEXTLINE_MAX_ATTEMPTS',6),eventsPerPass:integer('CONTEXTLINE_EVENTS_PER_PASS',5),heartbeatMs:integer('CONTEXTLINE_HEARTBEAT_MS',Math.max(100,Math.floor(integer('CONTEXTLINE_LEASE_MS',60000)/3))),drainTimeoutMs:integer('CONTEXTLINE_DRAIN_TIMEOUT_MS',30000),onDiagnostic:d=>console.error(JSON.stringify({level:'error',...d}))});
   const port=integer('CONTEXTLINE_METRICS_PORT',9090);
   server=createServer((req,res)=>{void (async()=>{
     if(req.method!=='GET'){res.writeHead(405);res.end();return;}

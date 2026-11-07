@@ -1,0 +1,55 @@
+name: Benchmark
+on:
+  schedule:
+    - cron: '0 3 * * 2'
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: Dependency rows to seed
+        default: '1000000'
+      iterations:
+        description: Measured calls per phase
+        default: '2000'
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Blueprint scale benchmark
+        run: npx tsx scripts/benchmark.ts > benchmark.log 2>&1
+        env:
+          BENCH_ROWS: ${{ github.event.inputs.rows || '1000000' }}
+          BENCH_TENANTS: '50'
+          BENCH_ITERATIONS: ${{ github.event.inputs.iterations || '2000' }}
+          BENCH_CACHE: '1'
+          BENCH_OUT: benchmark.json
+      - name: Publish report
+        if: always()
+        run: |
+          if [ -f benchmark.json ]; then
+            echo '## ContextLine benchmark' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat benchmark.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            tail -60 benchmark.log >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-report
+          path: |
+            benchmark.json
+            benchmark.log
+      - name: Report gate status
+        run: |
+          node -e "const r=require('./benchmark.json');console.log(JSON.stringify(r.gates));if(!r.gates.lookupP95Under2Ms||!r.gates.filterP95Under5Ms)process.exitCode=1"

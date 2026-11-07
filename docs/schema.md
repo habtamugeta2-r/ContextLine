@@ -2,7 +2,7 @@
 
 The authoritative DDL is [`packages/core/src/migrations/001_registry.sql`](../packages/core/src/migrations/001_registry.sql). It targets PostgreSQL 15+; local tests use PostgreSQL 17.9. The default schema is `contextline`.
 
-## 1. Why seven tables instead of four
+## 1. Why eight tables instead of four
 
 The supplied draft described four domain tables. That is enough to express sources, artifacts, dependencies, and an aggregate event, but not enough for the implementation's per-artifact retry/lease/verification state and per-request access evidence. This build keeps those four concepts and adds three operational tables:
 
@@ -41,6 +41,7 @@ Primary key: `(tenant_id, artifact_id, version)`.
 - `connector_id`: operator-configured routing key, not SQL or a URL credential.
 - `storage_ref`: opaque location understood by that connector.
 - `status`: `active | stale | deleted | pending_review`.
+- `owner_principal` (nullable, added in migration 002): opaque owner used by principal-scoped revocation. Only cache and memory artifacts with an owner are touched by a principal-scoped event.
 - `created_at`, `updated_at`.
 
 Identity, type, connector, storage reference, and root set are immutable through the registration API. Status is mutable through verified lifecycle work. A deleted version is a tombstone. New content requires a new artifact version/identity and a reviewed publication path.
@@ -105,7 +106,7 @@ The backward lookup is one batched query joining artifacts, dependencies, and so
 
 ## 4. Row-level security
 
-All seven tenant tables have RLS enabled and forced. Policies constrain both reads and writes:
+All eight tenant tables have RLS enabled and forced. Policies constrain both reads and writes:
 
 ```sql
 CREATE POLICY tenant_isolation ON dependencies
@@ -139,10 +140,36 @@ This coordinates registry state, not external storage writes. Publication fencin
 4. Verifies SHA-256 checksums of already-applied files.
 5. Applies new migrations and records checksums in one transaction.
 
-Never edit an applied migration. Add a new numbered migration and re-run grants if new tables are introduced. The current `grantRuntimeRole` helper grants only the seven v0.1 tables; future migrations must update it deliberately. Back up before migration and test restore in staging.
+Never edit an applied migration. Add a new numbered migration and re-run grants if new tables are introduced. The current `grantRuntimeRole` helper grants the eight v0.2 tables plus `EXECUTE` on the `lookup_artifacts` function; future migrations must update it deliberately. Back up before migration and test restore in staging.
 
 ## 7. Retention, growth, and partitioning
 
 There is no automatic audit deletion or retention scheduler in v0.1.0. Define retention with privacy/security owners, export required evidence, and purge through a privileged, audited maintenance process. Do not grant the runtime role core `DELETE` just to make cleanup convenient.
 
 Growth is roughly artifacts × average roots, plus access decisions per governed retrieval. Audit volume can dominate storage. The draft's 100K–100M artifact table is a planning hypothesis. Before partitioning, measure query plans, index bloat, autovacuum, audit write rate, and tenant skew. Tenant hash partitioning and read replicas are future work; they require migration and RLS regression tests.
+
+
+## 9. Migration 002 — blueprint conformance
+
+| Object | Purpose |
+|---|---|
+| `dependencies_backward_covering` | `(tenant_id, artifact_id, artifact_version) INCLUDE (source_id, source_version)` so the hot backward lookup is index-only. The redundant `dependencies_by_artifact` index is dropped. |
+| `artifacts.owner_principal` | Opaque owner for principal-scoped cache/memory cleanup; partial index `artifacts_owner`. |
+| `lifecycle_events.scope` | `principal | source_wide`, backfilled from the event type. |
+| `quarantine_manifest` | `(tenant_id, artifact_id, artifact_version)` with first/last seen, occurrence count, and `resolved_at`. Written from the SDK's background buffer, never on the request path. |
+| `lookup_artifacts(text, text[], integer[])` | `SECURITY INVOKER` function that sets the tenant GUC and then runs the batched backward lookup under the caller's RLS policies. |
+
+### Why a function and not a CTE
+
+`WITH ctx AS MATERIALIZED (SELECT set_config('app.current_tenant', $1, true)) SELECT ...` **does not work
+under RLS**. PostgreSQL evaluates the policy as a one-time filter before the CTE executes, so the query
+returns zero rows. `EXPLAIN ANALYZE` shows `One-Time Filter: nullif(current_setting(...)) = 'tenant'`
+above a `CTE ctx -> Result (never executed)`. A plpgsql function body runs sequentially, so the GUC is
+set before the scan. The function is `SECURITY INVOKER` (never `DEFINER`) and uses
+`SET search_path FROM CURRENT`, so it neither escalates privilege nor hardcodes a schema.
+
+### Table count
+
+Five blueprint tables (`sources`, `artifacts`, `dependencies`, `lifecycle_events`, `quarantine_manifest`)
+plus three that the implementation needs: `lifecycle_jobs` (per-artifact state and fencing),
+`access_runs`, and `access_decisions` (append-only audit).

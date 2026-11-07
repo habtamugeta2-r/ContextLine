@@ -14,7 +14,7 @@
 | Worker CLI qualification | Env-driven Node process | Startup, connector health, metrics, unknown-route handling, graceful stop |
 | `npm run check` | Build + unit + PostgreSQL + smoke | Default release gate |
 
-Current default suites contain **35 unit tests and 28 PostgreSQL integration tests**, plus the HTTP smoke workflow. Use runner output after changes as the authoritative count.
+Current default suites contain **47 unit tests and 41 PostgreSQL tests** (36 integration + 5 chaos scenarios), plus the HTTP smoke workflow, the example typecheck, and the blueprint gates. Use runner output after changes as the authoritative count.
 
 ## 2. Security-focused cases
 
@@ -89,3 +89,36 @@ This is a microbenchmark, not a production capacity test. Before claiming `<5ms 
 Every security-relevant change should include a regression test that fails before the fix. Prefer real PostgreSQL tests for locking/RLS/transaction behavior; mocks cannot prove those properties. Connector changes need both contract fakes and live-service qualification. Document any skipped environment explicitly.
 
 Do not convert a failing security assertion into a weaker expectation merely to make CI green. Determine whether the implementation or the stated invariant is wrong, then update both code and documentation deliberately.
+
+
+## Chaos scenarios
+
+`tests/chaos.test.ts` scripts the five blueprint stories against a real PostgreSQL cluster:
+
+| Scenario | Fault injected | Expected outcome (asserted) |
+|---|---|---|
+| Lying storage | `delete` returns success but the row remains, once | Verification fails, the job retries, attempt 2 converges, history records `verified: false` |
+| Mid-flight worker kill | A job is claimed and the worker never finishes | The lease expires, a second worker reclaims it, the dead worker's stale token cannot commit, exactly one completion is recorded |
+| Auth blackout | The callback exceeds its timeout | Everything denied with `authorization_timeout`; explicit fail-open is recorded as `authorization_allow_override`; recovery restores service |
+| Registry outage | A pool pointed at a closed port | `filterAuthorized` returns `[]` and `assertCanServe` returns false within the pool timeout, even with `onError: 'allow'` |
+| Four-hop cascade | document → chunk → answer → summary → fact | Every hop flattens to the same root, so one erasure event finds and deletes all four derivatives |
+
+## Blueprint gates
+
+`npm run gates` fails the build if:
+
+- the SDK's runtime dependency list is anything other than exactly `pg`;
+- the shipped SDK output exceeds 50KB gzipped (currently 17.5KB, unminified — a conservative upper bound);
+- any module outside `postgres.ts` and `connectors.ts` issues SQL;
+- the registry store names a table outside the registry, or reaches a customer storage table;
+- the worker touches storage other than through a connector.
+
+`npm run typecheck:examples` compiles the five adoption examples against the real SDK so they cannot
+drift from the API.
+
+## Benchmark
+
+`scripts/benchmark.ts` is configurable: `BENCH_ROWS`, `BENCH_TENANTS`, `BENCH_ITERATIONS`, `BENCH_CACHE`,
+`BENCH_GATE`, `BENCH_OUT`. It reports lookup, end-to-end, and warm-cache distributions separately with
+explicit pass/fail gates. `.github/workflows/benchmark.yml` runs it nightly and on demand at 1M rows.
+See [validation](validation.md) for the recorded numbers and their limits.

@@ -2,13 +2,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import pg from 'pg';
 import { ContextLineError, artifactKey, artifactRef, boundedArray, identifier, sourceRef, uniqueBy, validateEvent, validateRegistration, version } from './validation.js';
-import type { AccessDecision, ArtifactDependencies, ArtifactRecord, ArtifactRef, LifecycleEventRecord, LifecycleJob, RegisterDerivationInput, RegistryStore, Run, SourceEventInput, SourceRef, SourceState } from './types.js';
+import { eventScope, lifecycleActionFor } from './policy.js';
+import type { AccessDecision, ArtifactDependencies, ArtifactRecord, ArtifactRef, ArtifactType, LifecycleAction, LifecycleEventRecord, LifecycleJob, QuarantineEntry, QuarantineHit, RegisterDerivationInput, RegistryStore, Run, SourceEventInput, SourceRef, SourceState } from './types.js';
 
 export type Pool = pg.Pool;
 export type PoolConfig = pg.PoolConfig;
 export const createPool = (config: PoolConfig): Pool => new pg.Pool(config);
 const iso = (value: Date | string): string => new Date(value).toISOString();
 const json = (value: unknown): string => JSON.stringify(value);
+const CORE_TABLES = ['sources','artifacts','dependencies','lifecycle_events','lifecycle_jobs','access_runs','access_decisions','quarantine_manifest'] as const;
+const ARTIFACT_TYPES: ArtifactType[] = ['embedding','cache','summary','memory','other'];
+/** Blueprint A Part 0 A3: registration batches are ingestion-sized, not chunk-sized. */
+export const MAX_REGISTRATION_ARTIFACTS = 500;
 
 export class PostgresRegistry implements RegistryStore {
   readonly schema: string;
@@ -17,7 +22,7 @@ export class PostgresRegistry implements RegistryStore {
     if (!/^[a-z][a-z0-9_]{0,62}$/.test(this.schema)) throw new ContextLineError('INVALID_SCHEMA', 'Schema must be a lowercase SQL identifier');
   }
   private table(name: string): string {
-    if (!['sources','artifacts','dependencies','lifecycle_events','lifecycle_jobs','access_runs','access_decisions'].includes(name)) throw new Error('Invalid internal table');
+    if (!(CORE_TABLES as readonly string[]).includes(name)) throw new Error('Invalid internal table');
     return `"${this.schema}"."${name}"`;
   }
   async transaction<T>(tenantId: string, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -31,6 +36,14 @@ export class PostgresRegistry implements RegistryStore {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined); throw error;
     } finally { client.release(); }
+  }
+  /**
+   * Cold reads (UI, audit, operator tooling) use a transaction-local tenant setting.
+   * The hot retrieval path uses the `lookup_artifacts` SQL function instead, which is
+   * one round-trip; see migration 002 for why a set_config CTE cannot work under RLS.
+   */
+  private async read<T = Record<string, any>>(tenantId: string, fn: (client: pg.PoolClient) => Promise<T[]>): Promise<T[]> {
+    return this.transaction(tenantId, fn);
   }
   async healthCheck(): Promise<void> { await this.pool.query('SELECT 1'); }
 
@@ -48,6 +61,11 @@ export class PostgresRegistry implements RegistryStore {
     });
   }
 
+  /**
+   * Set-based registration: at most three bulk writes (optional sources, artifacts,
+   * dependencies) regardless of batch size, plus two set-based reads. Immutable identity,
+   * tombstones and the revocation race are all checked inside the same transaction.
+   */
   async registerDerivation(input: RegisterDerivationInput): Promise<void> {
     validateRegistration(input);
     if (input.run) this.validateRunShape(input.run, input.tenantId);
@@ -55,62 +73,99 @@ export class PostgresRegistry implements RegistryStore {
       if (input.run) await this.requireRun(c, input.run);
       const roots = new Map(input.sources.map(s => [s.id, sourceRef(s)]));
       const parents = uniqueBy((input.derivedFrom ?? []).map(artifactRef), artifactKey);
-      for (const parent of parents) {
-        const result = await c.query(`SELECT source_id, source_version FROM ${this.table('dependencies')} WHERE tenant_id=$1 AND artifact_id=$2 AND artifact_version=$3`, [input.tenantId, parent.id, parent.version]);
-        if (!result.rowCount) throw new ContextLineError('UNKNOWN_PARENT', 'Every derivedFrom artifact must have registered root provenance');
-        for (const row of result.rows) {
+      if (parents.length) {
+        const params: unknown[] = [input.tenantId];
+        const tuples = parents.map(p => { params.push(p.id, p.version); return `($${params.length-1},$${params.length})`; });
+        const rows = await c.query(`SELECT artifact_id,artifact_version,source_id,source_version FROM ${this.table('dependencies')} WHERE tenant_id=$1 AND (artifact_id,artifact_version) IN (${tuples.join(',')})`, params);
+        const seen = new Set<string>();
+        for (const row of rows.rows) {
+          seen.add(artifactKey({ id: row.artifact_id, version: row.artifact_version }));
           const root = { id: row.source_id as string, version: row.source_version as number };
           const previous = roots.get(root.id);
           if (previous && previous.version !== root.version) throw new ContextLineError('AMBIGUOUS_SOURCE', 'Conflicting root source versions');
           roots.set(root.id, root);
         }
+        for (const parent of parents) if (!seen.has(artifactKey(parent))) throw new ContextLineError('UNKNOWN_PARENT', 'Every derivedFrom artifact must have registered root provenance');
       }
       const sources = [...roots.values()].sort((a,b) => a.id.localeCompare(b.id) || a.version - b.version);
       boundedArray(sources, 'resolved root sources', 100);
-      const sourceRows = await c.query(`SELECT source_id, version, status, is_current FROM ${this.table('sources')} WHERE tenant_id=$1 AND (source_id,version) IN (${sources.map((_,i) => `($${2+i*2},$${3+i*2})`).join(',')}) ORDER BY source_id, version FOR SHARE`, [input.tenantId, ...sources.flatMap(s => [s.id, s.version])]);
-      if (sourceRows.rowCount !== sources.length) throw new ContextLineError('UNKNOWN_SOURCE', 'Register sources before registering derivatives');
       for (const a of input.artifacts) {
-        const ref = artifactRef(a);
-        if (parents.some(p => p.id === ref.id && p.version === ref.version)) throw new ContextLineError('DEPENDENCY_CYCLE', 'An artifact cannot derive from itself');
-        await c.query(`INSERT INTO ${this.table('artifacts')} (tenant_id,artifact_id,version,artifact_type,connector_id,storage_ref) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, [input.tenantId, ref.id, ref.version, a.type, a.connectorId, a.storageRef]);
-        const existing = await c.query(`SELECT artifact_type,connector_id,storage_ref FROM ${this.table('artifacts')} WHERE tenant_id=$1 AND artifact_id=$2 AND version=$3`, [input.tenantId, ref.id, ref.version]);
-        if (!existing.rowCount) throw new ContextLineError('CONCURRENT_REGISTRATION', 'Artifact registration raced another transaction; retry the operation');
-        const row = existing.rows[0];
-        if (row.artifact_type !== a.type || row.connector_id !== a.connectorId || row.storage_ref !== a.storageRef) throw new ContextLineError('IMMUTABLE_ARTIFACT', 'An artifact version cannot change type, connector, or storage reference');
-        const previous = await c.query(`SELECT source_id,source_version FROM ${this.table('dependencies')} WHERE tenant_id=$1 AND artifact_id=$2 AND artifact_version=$3`, [input.tenantId, ref.id, ref.version]);
-        const previousKeys = new Set(previous.rows.map(r => `${r.source_id}:${r.source_version}`));
-        if (previousKeys.size && (previousKeys.size !== sources.length || sources.some(s => !previousKeys.has(`${s.id}:${s.version}`)))) throw new ContextLineError('IMMUTABLE_PROVENANCE', 'An artifact version cannot silently change its root sources; register a new version');
-        // Exact retries remain no-ops, but a new artifact cannot appear after a source lifecycle snapshot.
-        if (!previousKeys.size && sourceRows.rows.some(s => s.status !== 'active' || !s.is_current)) throw new ContextLineError('SOURCE_UNAVAILABLE', 'New artifacts must reference active, current source versions; historical imports require a separate reviewed workflow');
-        for (const s of sources) await c.query(`INSERT INTO ${this.table('dependencies')} (tenant_id,artifact_id,artifact_version,source_id,source_version) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [input.tenantId, ref.id, ref.version, s.id, s.version]);
+        if (parents.some(p => p.id === a.id && (p.version ?? 1) === (a.version ?? 1))) throw new ContextLineError('DEPENDENCY_CYCLE', 'An artifact cannot derive from itself');
       }
+      // Bulk write 1 (optional): create only brand-new version-1 sources. Never reactivate.
+      if (input.createSources) {
+        const fresh = sources.filter(s => s.version === 1);
+        if (fresh.length) await c.query(`INSERT INTO ${this.table('sources')} (tenant_id,source_id,version) SELECT $1,s.id,1 FROM unnest($2::text[]) AS s(id) ON CONFLICT DO NOTHING`, [input.tenantId, fresh.map(s => s.id)]);
+      }
+      const sourceParams: unknown[] = [input.tenantId];
+      const sourceTuples = sources.map(s => { sourceParams.push(s.id, s.version); return `($${sourceParams.length-1},$${sourceParams.length})`; });
+      const sourceRows = await c.query(`SELECT source_id, version, status, is_current FROM ${this.table('sources')} WHERE tenant_id=$1 AND (source_id,version) IN (${sourceTuples.join(',')}) ORDER BY source_id, version FOR SHARE`, sourceParams);
+      if (sourceRows.rowCount !== sources.length) throw new ContextLineError('UNKNOWN_SOURCE', 'Register sources before registering derivatives, or pass createSources');
+      const refs = input.artifacts.map(a => artifactRef(a));
+      // Bulk write 2: one set-based insert for the whole batch.
+      await c.query(`INSERT INTO ${this.table('artifacts')} (tenant_id,artifact_id,version,artifact_type,connector_id,storage_ref,owner_principal)
+        SELECT $1,a.id,a.version,a.type,a.connector,a.storage_ref,a.owner
+        FROM unnest($2::text[],$3::int[],$4::text[],$5::text[],$6::text[],$7::text[]) AS a(id,version,type,connector,storage_ref,owner)
+        ON CONFLICT (tenant_id,artifact_id,version) DO NOTHING`, [
+        input.tenantId, refs.map(r => r.id), refs.map(r => r.version), input.artifacts.map(a => a.type),
+        input.artifacts.map(a => a.connectorId), input.artifacts.map(a => a.storageRef), input.artifacts.map(a => a.ownerPrincipal ?? null),
+      ]);
+      const existingParams: unknown[] = [input.tenantId];
+      const existingTuples = refs.map(r => { existingParams.push(r.id, r.version); return `($${existingParams.length-1},$${existingParams.length})`; });
+      const existing = await c.query(`SELECT a.artifact_id,a.version,a.artifact_type,a.connector_id,a.storage_ref,a.owner_principal,
+          coalesce(jsonb_agg(jsonb_build_object('id',d.source_id,'version',d.source_version) ORDER BY d.source_id) FILTER (WHERE d.source_id IS NOT NULL),'[]') AS sources
+        FROM ${this.table('artifacts')} a LEFT JOIN ${this.table('dependencies')} d ON d.tenant_id=a.tenant_id AND d.artifact_id=a.artifact_id AND d.artifact_version=a.version
+        WHERE a.tenant_id=$1 AND (a.artifact_id,a.version) IN (${existingTuples.join(',')}) GROUP BY a.tenant_id,a.artifact_id,a.version`, existingParams);
+      if (existing.rowCount !== refs.length) throw new ContextLineError('CONCURRENT_REGISTRATION', 'Artifact registration raced another transaction; retry the operation');
+      const byKey = new Map<string, any>(existing.rows.map(r => [artifactKey({ id: r.artifact_id, version: r.version }), r]));
+      const sourceUnavailable = sourceRows.rows.some(s => s.status !== 'active' || !s.is_current);
+      const edgeArtifacts: string[] = [], edgeVersions: number[] = [], edgeSources: string[] = [], edgeSourceVersions: number[] = [];
+      for (const [index,a] of input.artifacts.entries()) {
+        const ref = refs[index]!;
+        const row = byKey.get(artifactKey(ref));
+        if (row.artifact_type !== a.type || row.connector_id !== a.connectorId || row.storage_ref !== a.storageRef || (row.owner_principal ?? null) !== (a.ownerPrincipal ?? null)) {
+          throw new ContextLineError('IMMUTABLE_ARTIFACT', 'An artifact version cannot change type, connector, storage reference, or owner');
+        }
+        const previous = row.sources as SourceRef[];
+        if (previous.length) {
+          // Exact retry of a committed registration, including after deletion: a no-op.
+          if (previous.length !== sources.length || sources.some(s => !previous.some(p => p.id === s.id && p.version === s.version))) {
+            throw new ContextLineError('IMMUTABLE_PROVENANCE', 'An artifact version cannot silently change its root sources; register a new version');
+          }
+          continue;
+        }
+        // Blueprint A Part 0 B3: a source revoked mid-flight blocks the new artifact.
+        if (sourceUnavailable) throw new ContextLineError('SOURCE_UNAVAILABLE', 'New artifacts must reference active, current source versions; historical imports require a separate reviewed workflow');
+        for (const s of sources) { edgeArtifacts.push(ref.id); edgeVersions.push(ref.version); edgeSources.push(s.id); edgeSourceVersions.push(s.version); }
+      }
+      // Bulk write 3: the whole cross-product in one statement.
+      if (edgeArtifacts.length) await c.query(`INSERT INTO ${this.table('dependencies')} (tenant_id,artifact_id,artifact_version,source_id,source_version)
+        SELECT $1,e.aid,e.av,e.sid,e.sv FROM unnest($2::text[],$3::int[],$4::text[],$5::int[]) AS e(aid,av,sid,sv) ON CONFLICT DO NOTHING`,
+      [input.tenantId, edgeArtifacts, edgeVersions, edgeSources, edgeSourceVersions]);
     });
   }
 
+  /**
+   * Blueprint A Part 0 A1: ONE batched backward lookup, ONE network round-trip.
+   * The SQL function sets the tenant GUC before scanning, so RLS still applies and a
+   * pooled connection never carries another tenant's context. Explicit tenant
+   * predicates inside the function mean a GUC failure can only under-return rows.
+   */
   async lookupArtifacts(tenantId: string, refs: { id: string; version: number }[]): Promise<ArtifactDependencies[]> {
     identifier(tenantId, 'tenant ID'); boundedArray(refs, 'artifact lookups', 100); refs.forEach(artifactRef);
     const unique = uniqueBy(refs, artifactKey);
-    return this.transaction(tenantId, async c => {
-      const params: unknown[] = [tenantId];
-      const tuples = unique.map(r => { params.push(r.id, r.version); return `($${params.length-1},$${params.length})`; });
-      const result = await c.query(`SELECT a.artifact_id,a.version,a.artifact_type,a.connector_id,a.storage_ref,a.tenant_id,a.status,a.created_at,a.updated_at,
-        s.source_id,s.version AS source_version,s.status AS source_status,s.is_current
-        FROM ${this.table('artifacts')} a
-        LEFT JOIN ${this.table('dependencies')} d ON d.tenant_id=a.tenant_id AND d.artifact_id=a.artifact_id AND d.artifact_version=a.version
-        LEFT JOIN ${this.table('sources')} s ON s.tenant_id=d.tenant_id AND s.source_id=d.source_id AND s.version=d.source_version
-        WHERE a.tenant_id=$1 AND (a.artifact_id,a.version) IN (${tuples.join(',')}) ORDER BY a.artifact_id,a.version,s.source_id`, params);
-      const found = new Map<string, ArtifactDependencies>();
-      for (const row of result.rows) {
-        const key = artifactKey({ id: row.artifact_id, version: row.version });
-        if (!found.has(key)) found.set(key, { artifact: {
-          id: row.artifact_id, version: row.version, type: row.artifact_type, connectorId: row.connector_id,
-          storageRef: row.storage_ref, tenantId: row.tenant_id, status: row.status,
-          createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
-        }, sources: [] });
-        if (row.source_id) found.get(key)!.sources.push({ id: row.source_id, version: row.source_version, status: row.source_status, isCurrent: row.is_current });
-      }
-      return [...found.values()];
-    });
+    const result = await this.pool.query(`SELECT * FROM "${this.schema}".lookup_artifacts($1,$2::text[],$3::integer[])`, [tenantId, unique.map(r => r.id), unique.map(r => r.version)]);
+    const found = new Map<string, ArtifactDependencies>();
+    for (const row of result.rows) {
+      const key = artifactKey({ id: row.artifact_id, version: row.version });
+      if (!found.has(key)) found.set(key, { artifact: {
+        id: row.artifact_id, version: row.version, type: row.artifact_type, connectorId: row.connector_id,
+        storageRef: row.storage_ref, tenantId: row.tenant_id, status: row.status, ownerPrincipal: row.owner_principal ?? null,
+        createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
+      }, sources: [] });
+      if (row.source_id) found.get(key)!.sources.push({ id: row.source_id, version: row.source_version, status: row.source_status, isCurrent: row.is_current });
+    }
+    return [...found.values()];
   }
 
   private validateRunShape(run: Run, tenantId?: string): void {
@@ -148,6 +203,7 @@ export class PostgresRegistry implements RegistryStore {
   async recordSourceEvent(input: SourceEventInput): Promise<LifecycleEventRecord> {
     validateEvent(input);
     const principals = [...new Set(input.affectedPrincipals ?? [])].sort();
+    const scope = eventScope(input.event);
     const fingerprint = createHash('sha256').update(json({ sourceId: input.sourceId, event: input.event, principals, newVersion: input.newVersion ?? null, memoryAction: input.memoryAction ?? 'flag' })).digest('hex');
     return this.transaction(input.tenantId, async c => {
       // Same lock order as registration, avoiding shared/exclusive lock-order deadlocks.
@@ -162,7 +218,7 @@ export class PostgresRegistry implements RegistryStore {
         }
       }
       const sourceVersion: number = current.rows[0].version;
-      const authorizationOnly = ['permission_revoked','permission_granted'].includes(input.event);
+      const auditOnly = ['permission_granted','source_reactivated'].includes(input.event);
       if (input.event === 'document_updated') {
         if (input.newVersion !== sourceVersion + 1) throw new ContextLineError('INVALID_VERSION', 'newVersion must be exactly current version + 1');
         await c.query(`UPDATE ${this.table('sources')} SET is_current=false,updated_at=now() WHERE tenant_id=$1 AND source_id=$2 AND version=$3`, [input.tenantId,input.sourceId,sourceVersion]);
@@ -171,13 +227,13 @@ export class PostgresRegistry implements RegistryStore {
         const status = input.event === 'source_restricted' ? 'revoked' : input.event === 'retention_expired' ? 'expired' : input.event === 'source_reactivated' ? 'active' : 'deleted';
         await c.query(`UPDATE ${this.table('sources')} SET status=$3,updated_at=now() WHERE tenant_id=$1 AND source_id=$2`, [input.tenantId,input.sourceId,status]);
       }
-      const details = { propagation: authorizationOnly ? 'authorization_only' : 'storage', newVersion: input.newVersion ?? null, memoryAction: input.memoryAction ?? 'flag' };
-      const result = await c.query(`INSERT INTO ${this.table('lifecycle_events')} (tenant_id,event_id,source_id,source_version,event_type,affected_principals,idempotency_key,request_fingerprint,details,status,completed_at) VALUES ($1,$2,$3,$4,$5,$6::text[],$7,$8,$9::jsonb,$10,$11) RETURNING *`, [input.tenantId,randomUUID(),input.sourceId,sourceVersion,input.event,principals,input.idempotencyKey ?? null,fingerprint,json(details),authorizationOnly?'completed':'pending',authorizationOnly?new Date():null]);
+      const details = { propagation: auditOnly || scope === 'principal' && input.event === 'permission_granted' ? 'authorization_only' : 'storage', newVersion: input.newVersion ?? null, memoryAction: input.memoryAction ?? 'flag' };
+      const result = await c.query(`INSERT INTO ${this.table('lifecycle_events')} (tenant_id,event_id,source_id,source_version,event_type,scope,affected_principals,idempotency_key,request_fingerprint,details,status,completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7::text[],$8,$9,$10::jsonb,$11,$12) RETURNING *`, [input.tenantId,randomUUID(),input.sourceId,sourceVersion,input.event,scope,principals,input.idempotencyKey ?? null,fingerprint,json(details),auditOnly?'completed':'pending',auditOnly?new Date():null]);
       return this.mapEvent(result.rows[0]);
     });
   }
   mapEvent(row: Record<string, any>): LifecycleEventRecord {
-    return { id: row.event_id, tenantId: row.tenant_id, sourceId: row.source_id, sourceVersion: row.source_version, eventType: row.event_type, affectedPrincipals: row.affected_principals, affectedArtifacts: row.affected_artifacts, processedArtifacts: row.processed_artifacts, status: row.status, jobsReady: row.jobs_ready, details: row.details, createdAt: iso(row.created_at), startedAt: row.started_at ? iso(row.started_at) : null, completedAt: row.completed_at ? iso(row.completed_at) : null };
+    return { id: row.event_id, tenantId: row.tenant_id, sourceId: row.source_id, sourceVersion: row.source_version, eventType: row.event_type, scope: row.scope ?? eventScope(row.event_type), affectedPrincipals: row.affected_principals, affectedArtifacts: row.affected_artifacts, processedArtifacts: row.processed_artifacts, status: row.status, jobsReady: row.jobs_ready, details: row.details, createdAt: iso(row.created_at), startedAt: row.started_at ? iso(row.started_at) : null, completedAt: row.completed_at ? iso(row.completed_at) : null };
   }
   mapJob(row: Record<string, any>): LifecycleJob {
     return { id: row.job_id, eventId: row.event_id, tenantId: row.tenant_id, artifactId: row.artifact_id, artifactVersion: row.artifact_version, artifactType: row.artifact_type, connectorId: row.connector_id, storageRef: row.storage_ref, action: row.action, status: row.status, attempts: row.attempts, maxAttempts: row.max_attempts, nextAttemptAt: iso(row.next_attempt_at), leaseUntil: row.lease_until ? iso(row.lease_until) : null, leaseToken: row.lease_token, lastErrorCode: row.last_error_code, verifiedAt: row.verified_at ? iso(row.verified_at) : null, history: row.history };
@@ -187,16 +243,24 @@ export class PostgresRegistry implements RegistryStore {
   async materializeNextEvent(tenantId: string, maxAttempts = 6): Promise<LifecycleEventRecord | null> {
     if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 20) throw new ContextLineError('INVALID_CONFIG', 'maxAttempts must be 1–20');
     return this.transaction(tenantId, async c => {
-      const claim = await c.query(`SELECT * FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 AND NOT jobs_ready AND status='pending' ORDER BY CASE WHEN event_type IN ('gdpr_erasure_requested','document_deleted') THEN 0 ELSE 1 END,created_at FOR UPDATE SKIP LOCKED LIMIT 1`, [tenantId]);
+      const claim = await c.query(`SELECT * FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 AND NOT jobs_ready AND status='pending'
+        ORDER BY CASE WHEN event_type IN ('gdpr_erasure_requested','source_restricted','permission_revoked') THEN 0 WHEN event_type IN ('document_deleted','retention_expired') THEN 1 ELSE 2 END,created_at
+        FOR UPDATE SKIP LOCKED LIMIT 1`, [tenantId]);
       if (!claim.rowCount) return null;
       const event = this.mapEvent(claim.rows[0]);
       await c.query(`SELECT version FROM ${this.table('sources')} WHERE tenant_id=$1 AND source_id=$2 ORDER BY version FOR UPDATE`, [tenantId,event.sourceId]);
-      const action = ['document_deleted','gdpr_erasure_requested','retention_expired'].includes(event.eventType) ? 'delete' : event.eventType === 'source_restricted' && event.details.memoryAction === 'delete' ? 'delete' : 'invalidate';
+      const memoryAction: LifecycleAction = event.details.memoryAction as LifecycleAction ?? 'flag';
+      const actions = ARTIFACT_TYPES.map(type => lifecycleActionFor(event.eventType, type, memoryAction));
+      const principalScoped = event.scope === 'principal';
+      const allVersions = event.eventType !== 'document_updated';
       await c.query(`INSERT INTO ${this.table('lifecycle_jobs')} (tenant_id,job_id,event_id,artifact_id,artifact_version,action,max_attempts)
-        SELECT $1,gen_random_uuid(),$2,a.artifact_id,a.version,CASE WHEN $5='delete' THEN 'delete' WHEN a.artifact_type='memory' AND $6='flag' THEN 'flag' ELSE $5 END,$4
+        SELECT $1,gen_random_uuid(),$2,a.artifact_id,a.version,
+          CASE a.artifact_type WHEN 'embedding' THEN $5 WHEN 'cache' THEN $6 WHEN 'summary' THEN $7 WHEN 'memory' THEN $8 ELSE $9 END,$4
         FROM ${this.table('dependencies')} d JOIN ${this.table('artifacts')} a ON a.tenant_id=d.tenant_id AND a.artifact_id=d.artifact_id AND a.version=d.artifact_version
-        WHERE d.tenant_id=$1 AND d.source_id=$3 AND ($5='delete' OR $8 OR d.source_version=$7) AND a.status <> 'deleted'
-        ON CONFLICT DO NOTHING`, [tenantId,event.id,event.sourceId,maxAttempts,action,event.details.memoryAction ?? 'flag',event.sourceVersion,event.eventType === 'source_restricted']);
+        WHERE d.tenant_id=$1 AND d.source_id=$3 AND ($10 OR d.source_version=$11) AND a.status <> 'deleted'
+          AND CASE a.artifact_type WHEN 'embedding' THEN $5 WHEN 'cache' THEN $6 WHEN 'summary' THEN $7 WHEN 'memory' THEN $8 ELSE $9 END IS NOT NULL
+          AND (NOT $12::boolean OR (a.status='active' AND a.artifact_type IN ('cache','memory') AND a.owner_principal = ANY($13::text[])))
+        ON CONFLICT DO NOTHING`, [tenantId,event.id,event.sourceId,maxAttempts,actions[0],actions[1],actions[2],actions[3],actions[4],allVersions,event.sourceVersion,principalScoped,event.affectedPrincipals]);
       const count = await c.query(`SELECT count(*)::int AS n FROM ${this.table('lifecycle_jobs')} WHERE tenant_id=$1 AND event_id=$2`, [tenantId,event.id]);
       const n: number = count.rows[0].n;
       const result = await c.query(`UPDATE ${this.table('lifecycle_events')} SET jobs_ready=true,affected_artifacts=$3,processed_artifacts=0,status=$4,started_at=now(),completed_at=$5 WHERE tenant_id=$1 AND event_id=$2 RETURNING *`, [tenantId,event.id,n,n?'processing':'completed',n?null:new Date()]);
@@ -217,6 +281,15 @@ export class PostgresRegistry implements RegistryStore {
         jobs.push(this.mapJob({ ...updated.rows[0], artifact_type: row.artifact_type, connector_id: row.connector_id, storage_ref: row.storage_ref }));
       }
       return jobs;
+    });
+  }
+  /** Blueprint A Part 5: extend the lease while work is genuinely in flight. */
+  async heartbeatJob(job: LifecycleJob, leaseMs: number): Promise<boolean> {
+    return this.transaction(job.tenantId, async c => {
+      const result = await c.query(`UPDATE ${this.table('lifecycle_jobs')} SET lease_until=now()+($4::double precision * interval '1 millisecond'),updated_at=now()
+        WHERE tenant_id=$1 AND job_id=$2::uuid AND lease_token=$3::uuid AND status='processing' RETURNING job_id`,
+      [job.tenantId,job.id,job.leaseToken,leaseMs]);
+      return (result.rowCount ?? 0) > 0;
     });
   }
   async finishJob(job: LifecycleJob, result: { status: 'completed' | 'pending_review' | 'retry' | 'failed'; errorCode?: string | undefined; verified?: boolean | undefined; delayMs?: number | undefined }): Promise<boolean> {
@@ -241,7 +314,6 @@ export class PostgresRegistry implements RegistryStore {
     await c.query(`SELECT 1 FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 AND event_id=$2::uuid FOR UPDATE`, [tenantId,eventId]);
     const result = await c.query(`SELECT status,count(*)::int AS n FROM ${this.table('lifecycle_jobs')} WHERE tenant_id=$1 AND event_id=$2 GROUP BY status`, [tenantId,eventId]);
     const counts: Record<string,number> = Object.fromEntries(result.rows.map(r => [r.status,r.n]));
-    const total = Object.values(counts).reduce((a,b) => a+b,0);
     const processed = (counts.completed ?? 0)+(counts.pending_review ?? 0)+(counts.failed ?? 0);
     const unfinished = (counts.pending ?? 0)+(counts.processing ?? 0)+(counts.retry ?? 0);
     const status = unfinished ? (counts.failed || counts.pending_review ? 'partial' : 'processing') : counts.failed ? 'failed' : counts.pending_review ? 'partial' : 'completed';
@@ -271,45 +343,54 @@ export class PostgresRegistry implements RegistryStore {
     });
   }
   async getEvent(tenantId: string, eventId: string): Promise<LifecycleEventRecord | null> {
-    return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT * FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 AND event_id=$2::uuid`, [tenantId,eventId]);
-      return result.rowCount ? this.mapEvent(result.rows[0]) : null;
-    });
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT * FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 AND event_id=$2::uuid`, [tenantId,eventId])).rows);
+    return rows.length ? this.mapEvent(rows[0]!) : null;
   }
   async listEvents(tenantId: string, limit = 50): Promise<LifecycleEventRecord[]> {
-    return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT * FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT $2`, [tenantId,Math.min(100,Math.max(1,limit))]);
-      return result.rows.map(r => this.mapEvent(r));
-    });
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT * FROM ${this.table('lifecycle_events')} WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT $2`, [tenantId,Math.min(100,Math.max(1,limit))])).rows);
+    return rows.map(r => this.mapEvent(r));
   }
   async listJobs(tenantId: string, eventId?: string): Promise<LifecycleJob[]> {
-    return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT j.*,a.artifact_type,a.connector_id,a.storage_ref FROM ${this.table('lifecycle_jobs')} j JOIN ${this.table('artifacts')} a ON a.tenant_id=j.tenant_id AND a.artifact_id=j.artifact_id AND a.version=j.artifact_version WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.event_id=$2::uuid) ORDER BY j.created_at,j.artifact_id LIMIT 1000`, [tenantId,eventId ?? null]);
-      return result.rows.map(r => this.mapJob(r));
-    });
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT j.*,a.artifact_type,a.connector_id,a.storage_ref FROM ${this.table('lifecycle_jobs')} j JOIN ${this.table('artifacts')} a ON a.tenant_id=j.tenant_id AND a.artifact_id=j.artifact_id AND a.version=j.artifact_version WHERE j.tenant_id=$1 AND ($2::uuid IS NULL OR j.event_id=$2::uuid) ORDER BY j.created_at,j.artifact_id LIMIT 1000`, [tenantId,eventId ?? null])).rows);
+    return rows.map(r => this.mapJob(r));
   }
   async listSources(tenantId: string): Promise<(SourceState & { updatedAt: string })[]> {
-    return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT * FROM ${this.table('sources')} WHERE tenant_id=$1 ORDER BY source_id,version`, [tenantId]);
-      return result.rows.map(r => ({ id:r.source_id,version:r.version,status:r.status,isCurrent:r.is_current,updatedAt:iso(r.updated_at) }));
-    });
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT * FROM ${this.table('sources')} WHERE tenant_id=$1 ORDER BY source_id,version`, [tenantId])).rows);
+    return rows.map(r => ({ id:r.source_id,version:r.version,status:r.status,isCurrent:r.is_current,updatedAt:iso(r.updated_at) }));
   }
   async listArtifacts(tenantId: string): Promise<(ArtifactRecord & { sources: SourceRef[] })[]> {
-    return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT a.*,coalesce(jsonb_agg(jsonb_build_object('id',d.source_id,'version',d.source_version) ORDER BY d.source_id) FILTER (WHERE d.source_id IS NOT NULL),'[]') AS sources FROM ${this.table('artifacts')} a LEFT JOIN ${this.table('dependencies')} d ON d.tenant_id=a.tenant_id AND d.artifact_id=a.artifact_id AND d.artifact_version=a.version WHERE a.tenant_id=$1 GROUP BY a.tenant_id,a.artifact_id,a.version ORDER BY a.artifact_id LIMIT 1000`, [tenantId]);
-      return result.rows.map(r => ({ id:r.artifact_id,version:r.version,type:r.artifact_type,connectorId:r.connector_id,storageRef:r.storage_ref,tenantId:r.tenant_id,status:r.status,createdAt:iso(r.created_at),updatedAt:iso(r.updated_at),sources:r.sources }));
-    });
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT a.*,coalesce(jsonb_agg(jsonb_build_object('id',d.source_id,'version',d.source_version) ORDER BY d.source_id) FILTER (WHERE d.source_id IS NOT NULL),'[]') AS sources FROM ${this.table('artifacts')} a LEFT JOIN ${this.table('dependencies')} d ON d.tenant_id=a.tenant_id AND d.artifact_id=a.artifact_id AND d.artifact_version=a.version WHERE a.tenant_id=$1 GROUP BY a.tenant_id,a.artifact_id,a.version ORDER BY a.artifact_id LIMIT 1000`, [tenantId])).rows);
+    return rows.map(r => ({ id:r.artifact_id,version:r.version,type:r.artifact_type,connectorId:r.connector_id,storageRef:r.storage_ref,tenantId:r.tenant_id,status:r.status,ownerPrincipal:r.owner_principal ?? null,createdAt:iso(r.created_at),updatedAt:iso(r.updated_at),sources:r.sources }));
   }
   async listDecisions(tenantId: string, runId?: string): Promise<(AccessDecision & { runId: string; principal: string; createdAt: string; durationMs: number })[]> {
-    return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT d.*,r.principal FROM ${this.table('access_decisions')} d JOIN ${this.table('access_runs')} r ON r.tenant_id=d.tenant_id AND r.run_id=d.run_id WHERE d.tenant_id=$1 AND ($2::uuid IS NULL OR d.run_id=$2::uuid) ORDER BY d.created_at DESC,d.artifact_id LIMIT 200`, [tenantId,runId ?? null]);
-      return result.rows.map(r => ({ runId:r.run_id,principal:r.principal,artifactId:r.artifact_id,artifactVersion:r.artifact_version,allowed:r.allowed,outcome:r.outcome,reason:r.reason,sources:r.source_refs,createdAt:iso(r.created_at),durationMs:Number(r.duration_ms) }));
-    });
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT d.*,r.principal FROM ${this.table('access_decisions')} d JOIN ${this.table('access_runs')} r ON r.tenant_id=d.tenant_id AND r.run_id=d.run_id WHERE d.tenant_id=$1 AND ($2::uuid IS NULL OR d.run_id=$2::uuid) ORDER BY d.created_at DESC,d.artifact_id LIMIT 200`, [tenantId,runId ?? null])).rows);
+    return rows.map(r => ({ runId:r.run_id,principal:r.principal,artifactId:r.artifact_id,artifactVersion:r.artifact_version,allowed:r.allowed,outcome:r.outcome,reason:r.reason,sources:r.source_refs,createdAt:iso(r.created_at),durationMs:Number(r.duration_ms) }));
   }
   async queueStats(tenantId: string): Promise<{ pending: number; failed: number; review: number }> {
+    const rows = await this.read<{ pending:number; failed:number; review:number }>(tenantId, async c => (await c.query(`SELECT count(*) FILTER (WHERE status IN ('pending','processing','retry'))::int AS pending,count(*) FILTER (WHERE status='failed')::int AS failed,count(*) FILTER (WHERE status='pending_review')::int AS review FROM ${this.table('lifecycle_jobs')} WHERE tenant_id=$1`,[tenantId])).rows);
+    return rows[0] ?? { pending:0,failed:0,review:0 };
+  }
+  /** Blueprint A Part 0 A7: flushed from the SDK's background buffer, never per request. */
+  async recordQuarantineHits(tenantId: string, hits: QuarantineHit[]): Promise<void> {
+    boundedArray(hits, 'quarantine hits', 1000, true);
+    if (!hits.length) return;
+    await this.transaction(tenantId, async c => {
+      await c.query(`INSERT INTO ${this.table('quarantine_manifest')} AS q (tenant_id,artifact_id,artifact_version,occurrence_count)
+        SELECT $1,h.id,h.version,h.n FROM unnest($2::text[],$3::int[],$4::bigint[]) AS h(id,version,n)
+        ON CONFLICT (tenant_id,artifact_id,artifact_version) DO UPDATE SET last_seen_at=now(),occurrence_count=q.occurrence_count+EXCLUDED.occurrence_count,resolved_at=NULL`,
+      [tenantId, hits.map(h => h.artifactId), hits.map(h => h.artifactVersion), hits.map(h => h.count ?? 1)]);
+    });
+  }
+  async listQuarantine(tenantId: string, includeResolved = false): Promise<QuarantineEntry[]> {
+    const rows = await this.read(tenantId, async c => (await c.query(`SELECT * FROM ${this.table('quarantine_manifest')} WHERE tenant_id=$1 AND ($2::boolean OR resolved_at IS NULL) ORDER BY occurrence_count DESC,last_seen_at DESC LIMIT 1000`, [tenantId,includeResolved])).rows);
+    return rows.map(r => ({ artifactId:r.artifact_id,artifactVersion:r.artifact_version,firstSeenAt:iso(r.first_seen_at),lastSeenAt:iso(r.last_seen_at),occurrenceCount:Number(r.occurrence_count),resolvedAt:r.resolved_at?iso(r.resolved_at):null }));
+  }
+  async resolveQuarantine(tenantId: string, refs: ArtifactRef[]): Promise<number> {
+    boundedArray(refs, 'quarantine references', 1000);
+    const resolved = refs.map(artifactRef);
     return this.transaction(tenantId, async c => {
-      const result = await c.query(`SELECT count(*) FILTER (WHERE status IN ('pending','processing','retry'))::int AS pending,count(*) FILTER (WHERE status='failed')::int AS failed,count(*) FILTER (WHERE status='pending_review')::int AS review FROM ${this.table('lifecycle_jobs')} WHERE tenant_id=$1`,[tenantId]);
-      return result.rows[0];
+      const result = await c.query(`UPDATE ${this.table('quarantine_manifest')} q SET resolved_at=now() FROM unnest($2::text[],$3::int[]) AS r(id,version) WHERE q.tenant_id=$1 AND q.artifact_id=r.id AND q.artifact_version=r.version AND q.resolved_at IS NULL`, [tenantId,resolved.map(r => r.id),resolved.map(r => r.version)]);
+      return result.rowCount ?? 0;
     });
   }
   metricsText(tenantId: string, values: { processed: number; failures: number; claimed: number }): string {
@@ -360,10 +441,11 @@ export async function grantRuntimeRole(pool: Pool, role: string, schema = 'conte
     if (owner.rows[0]?.owner === role) throw new ContextLineError('UNSAFE_ROLE', 'Runtime role must not own the registry tables');
     await client.query('BEGIN');
     await client.query(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
-    for (const table of ['sources','artifacts','dependencies','lifecycle_events','lifecycle_jobs','access_runs','access_decisions']) {
-      const privileges = ['sources','artifacts','lifecycle_events','lifecycle_jobs'].includes(table) ? 'SELECT,INSERT,UPDATE' : 'SELECT,INSERT';
+    for (const table of CORE_TABLES) {
+      const privileges = ['sources','artifacts','lifecycle_events','lifecycle_jobs','quarantine_manifest'].includes(table) ? 'SELECT,INSERT,UPDATE' : 'SELECT,INSERT';
       await client.query(`GRANT ${privileges} ON "${schema}"."${table}" TO "${role}"`);
     }
+    await client.query(`GRANT EXECUTE ON FUNCTION "${schema}".lookup_artifacts(text,text[],integer[]) TO "${role}"`);
     await client.query('COMMIT');
   } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
   finally { client.release(); }

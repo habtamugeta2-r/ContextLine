@@ -62,7 +62,7 @@ This creates a fresh temporary PostgreSQL cluster and random free ports, runs th
 npm run check
 ```
 
-This runs the build, 35 unit tests, 28 real-PostgreSQL integration tests, and an HTTP smoke test. Counts are current for v0.1.0; use the test runner output as the authoritative count after changes.
+This runs the build, the example typecheck, the blueprint gates, 47 unit tests, 41 real-PostgreSQL tests (including five chaos scenarios), and an HTTP smoke test. Counts are current for v0.2.0; use the test runner output as the authoritative count after changes.
 
 Individual commands:
 

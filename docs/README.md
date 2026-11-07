@@ -10,6 +10,12 @@
 4. [SDK and API reference](api.md) — complete integration examples and error semantics.
 5. [Deployment](deployment.md) — PostgreSQL roles, worker configuration, containers, and production checklist.
 
+## Blueprint record
+
+- [Blueprint (Revised)](blueprint/blueprint-revised.md): the authoritative specification supplied by the project owner, with [provenance and precedence](blueprint/README.md) for all three passes.
+- [Blueprint conflicts](blueprint-conflicts.md): every disagreement between the three passes, the chosen behavior, and why.
+- [Conformance matrix](conformance.md): 96 requirements tracked as met / partial / deviation / deferred, each with evidence.
+
 ## Engineering reference
 
 - [Requirements and scope](requirements.md): implementation status and normalized traceability for the supplied brief's 30 themes.
@@ -20,6 +26,7 @@
 - [Threat model](threat-model.md): assets, attackers, abuse cases, mitigations, and explicit residual risks.
 - [Testing and validation](testing.md): reproducible test suites and adversarial cases.
 - [Validation results](validation.md): what was actually executed and measured in this repository.
+- [Benchmark report](benchmark-1m.json): the 1M-row / 50-tenant run behind the latency gates.
 - [Architecture decisions](decisions.md): why the implementation differs from the initial draft where necessary.
 - [Roadmap](roadmap.md): production gaps, prioritized experiments, and acceptance criteria.
 - [Changelog](changelog.md) and [third-party notices](third-party.md).
