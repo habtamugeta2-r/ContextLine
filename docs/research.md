@@ -137,3 +137,21 @@ Do not proceed to a hosted control plane until self-managed adoption proves the 
 - Legal analysis is engineering-oriented and requires counsel for a specific deployment.
 
 These gaps are recorded rather than filled with invented numbers. The next research iteration should prioritize interviews and real integration drills over more market-size prose.
+
+## 9. Audits of supplied material
+
+Research the owner pastes into the project is recorded verbatim and then verified, never repeated
+unchecked. Two artifacts are on file:
+
+| Supplied material | Record | Verification |
+|---|---|---|
+| Three engineering blueprint passes (2026-11-07) | [blueprint/](blueprint/README.md) | [blueprint-conflicts](blueprint-conflicts.md), [conformance](conformance.md) |
+| Three-topic research report: blockchain scaling, AI-assisted development, rapid prototyping (2026-11-07) | [external/2026-11-07-three-topic-research-report.md](external/2026-11-07-three-topic-research-report.md) | [research-audit](research-audit.md) |
+
+The second is **not** a ContextLine specification and changed no product code. Its audit checked 31
+claims: 11 verified, 11 corrected, 6 unverifiable, 3 structurally defective. The most consequential
+correction is that Ethereum's execution-sharding plan — the premise of its blockchain section — was
+cancelled, and the ~100,000 TPS figure describes a rollup ecosystem vision, not base-layer execution.
+Its strongest finding did survive: AI coding tools raise code activity by up to 180% but shipped releases
+by only ~30%, with no measured increase in app downloads. That is an argument for investing in
+validation throughput, which is where this repository's CI gates already sit.

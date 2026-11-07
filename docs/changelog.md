@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — documentation only
+
+- Recorded the supplied three-topic research report verbatim under `docs/external/` and audited it in
+  [research-audit](research-audit.md): 31 claims checked, 11 verified, 11 corrected, 6 unverifiable,
+  3 structurally defective. Key correction: Ethereum's execution-sharding plan was cancelled and
+  PeerDAS shipped in December 2025, so the report's scaling premise and its "shard-compatible contracts"
+  advice are obsolete. No product code changed.
+
 ## 0.2.0 — 2026-11-07 (blueprint conformance)
 
 Acts on the three supplied blueprint passes; the **Revised** pass governs conflicts.

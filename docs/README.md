@@ -34,6 +34,7 @@
 ## Research and product record
 
 - [Research and evidence ledger](research.md): primary-source findings, supported claims, corrections, and open questions.
+- [Research audit](research-audit.md): claim-by-claim verification of the three-topic report supplied on 2026-11-07, with the [verbatim artifact](external/2026-11-07-three-topic-research-report.md). Not a product specification.
 - [Product strategy](product-strategy.md): problem, market hypotheses, competition, pricing experiments, GTM, risks, and founding-team needs.
 - [Interactive demo guide](demo.md): every control and the underlying implementation.
 
