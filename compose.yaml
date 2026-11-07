@@ -1,0 +1,60 @@
+# Local integration / qualification stack, not a production HA deployment.
+# Set the four password/URL variables in .env before starting. See docs/deployment.md.
+name: contextline
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: contextline_owner
+      POSTGRES_PASSWORD: ${CONTEXTLINE_OWNER_PASSWORD:?set in .env}
+      POSTGRES_DB: contextline
+    volumes:
+      - registry_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contextline_owner -d contextline"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
+    volumes:
+      - cache_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+  migrate:
+    build: .
+    command: ["sh", "-c", "node packages/core/dist/cli.js && node deploy/provision-role.mjs"]
+    environment:
+      CONTEXTLINE_MIGRATION_DATABASE_URL: postgresql://contextline_owner:${CONTEXTLINE_OWNER_PASSWORD}@postgres:5432/contextline
+      CONTEXTLINE_RUNTIME_ROLE: contextline_app
+      CONTEXTLINE_RUNTIME_PASSWORD: ${CONTEXTLINE_APP_PASSWORD:?set in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://contextline_app:${CONTEXTLINE_APP_PASSWORD}@postgres:5432/contextline
+      REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379
+      CONTEXTLINE_CONNECTORS_FILE: /app/connectors.json
+      CONTEXTLINE_WORKER_TENANTS: ${CONTEXTLINE_WORKER_TENANTS:-acme-corp}
+    volumes:
+      - ./connectors.example.json:/app/connectors.json:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  registry_data:
+  cache_data:

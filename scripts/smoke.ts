@@ -1,0 +1,33 @@
+import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import assert from 'node:assert/strict';
+import { DemoApp,freePort,DEMO_QUESTION } from '../apps/demo/src/app.js';
+const dataDir=resolve('.contextline',`smoke-${randomUUID()}`);
+const app=new DemoApp({dataDir,port:0,databasePort:await freePort(),host:'127.0.0.1'});
+try {
+  await app.start();const base=`http://127.0.0.1:${app.port}`;
+  const html=await fetch(base);assert.equal(html.status,200);assert.ok((await html.text()).includes('ContextLine'));
+  assert.equal((await fetch(`${base}/assets/app.js`)).status,200);assert.equal((await fetch(`${base}/assets/style.css`)).status,200);assert.equal((await fetch(`${base}/assets/missing.css`)).status,404);assert.equal((await fetch(`${base}/docs/missing.md`)).status,404);
+  assert.equal((await fetch(`${base}/docs/README.md`)).status,200);
+  assert.equal((await fetch(`${base}/api/health`)).status,200);
+  const snapshot=await (await fetch(`${base}/api/snapshot?tenant=acme-corp`)).json();assert.equal(snapshot.artifacts.length,20);assert.equal(snapshot.storageCounts.chunks,14);
+  const post=(path:string,body:unknown,headers:Record<string,string>={})=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(body)});
+  const query=(principal:string)=>post('/api/query',{tenant:'acme-corp',principal,question:DEMO_QUESTION}).then(r=>r.json());
+  assert.equal((await query('alice')).authorizedCount,1);
+  assert.equal((await post('/api/query',{tenant:'acme-corp'},{Origin:'https://evil.example'})).status,403);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'toggle-worker'})).status,200);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'revoke-principal',principal:'alice'})).status,200);
+  const after=await query('alice');assert.equal(after.authorizedCount,0);assert.ok(!after.answer.includes('$12.4M'));
+  const other=await (await fetch(`${base}/api/snapshot?tenant=other-corp`)).json();assert.equal(other.artifacts.length,3);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'delete-source'})).status,200);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'process-queue'})).status,200);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'process-queue'})).status,200);
+  const cleaned=await (await fetch(`${base}/api/snapshot?tenant=acme-corp`)).json();assert.equal(cleaned.storageCounts.chunks,2);assert.equal(cleaned.storageCounts.cache,0);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'reset'})).status,200);
+  assert.equal((await query('alice')).authorizedCount,1);
+  assert.equal((await post('/api/action',{tenant:'acme-corp',action:'unknown'})).status,400);
+  assert.equal((await fetch(`${base}/api/snapshot?tenant=unknown`)).status,400);
+  assert.ok((await (await fetch(`${base}/api/metrics`)).text()).includes('contextline_queue_jobs'));
+  console.log('HTTP smoke passed: assets, docs, health, tenant isolation, revocation, paused-worker enforcement, cleanup, reset, CSRF rejection, metrics.');
+} finally {await app.stop();await rm(dataDir,{recursive:true,force:true});}

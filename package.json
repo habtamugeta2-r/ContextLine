@@ -1,0 +1,32 @@
+{
+  "name": "contextline-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Source-aware access control and lifecycle propagation for AI derivatives",
+  "type": "module",
+  "workspaces": ["packages/*", "apps/*"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json && node scripts/copy-assets.mjs",
+    "typecheck": "tsc -b tsconfig.build.json",
+    "test:unit": "tsx --test tests/validation.test.ts tests/sdk.test.ts tests/connectors.test.ts",
+    "test:postgres": "tsx --test --test-concurrency=1 tests/postgres.test.ts",
+    "test": "npm run test:unit && npm run test:postgres",
+    "test:live": "tsx --test --test-concurrency=1 tests/live-connectors.test.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "check": "npm run build && npm test && npm run smoke",
+    "demo": "npm run build && node apps/demo/dist/server.js",
+    "demo:cli": "npm run build && node apps/demo/dist/cli.js",
+    "migrate": "npm run build && node packages/core/dist/cli.js",
+    "worker": "npm run build && node packages/worker/dist/cli.js",
+    "benchmark": "npm run build && tsx scripts/benchmark.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.3",
+    "@types/pg": "8.23.1",
+    "@embedded-postgres/linux-x64": "17.9.0-beta.17",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  },
+  "license": "Apache-2.0"
+}
