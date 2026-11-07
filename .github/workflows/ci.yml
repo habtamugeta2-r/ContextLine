@@ -36,6 +36,11 @@ jobs:
         run: npm run build > build.log 2>&1
       - name: Unit tests
         run: npm run test:unit > unit.log 2>&1
+      - name: Inspect embedded PostgreSQL binaries
+        run: |
+          native=node_modules/@embedded-postgres/linux-x64/native/bin
+          "$native/postgres" --version || true
+          ldd "$native/postgres" || true
       - name: PostgreSQL tests
         run: npm run test:postgres > postgres.log 2>&1
       - name: HTTP smoke
@@ -56,6 +61,12 @@ jobs:
           node <<'NODE'
           const fs = require('node:fs');
           const files = ['build.log','unit.log','postgres.log','smoke.log','live.log','audit.log','docker.log'];
+          if (fs.existsSync('.contextline')) {
+            for (const dir of fs.readdirSync('.contextline')) {
+              const log = `.contextline/${dir}/server.log`;
+              if (fs.existsSync(log)) files.push(log);
+            }
+          }
           for (const file of files) {
             if (!fs.existsSync(file)) continue;
             const text = fs.readFileSync(file, 'utf8');
