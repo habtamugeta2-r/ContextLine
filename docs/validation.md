@@ -27,7 +27,7 @@
 | Interactive HTTP checks | Pass | Snapshot/query/reset against the running demo server; `/api/metrics` exposes 8 TYPE headers |
 | Quarantine CLI against the demo registry | Pass | Buffered hit invisible before flush, visible after; `quarantine list` shows it; `resolve` marks it resolved; missing `--tenant` exits 1 |
 | Worker CLI against the demo registry | Pass | Env-driven startup, `/health`, 8 unique Prometheus TYPE headers (adds `contextline_connector_healthy`), 404 for unknown route, graceful stop |
-| GitHub Actions CI | **Pass** | Run [42396690030](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42396690030) on commit `3929a73`: build, unit, PostgreSQL, smoke, live connectors, audit, container build |
+| GitHub Actions CI | **Pass** | Run [42399911024](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42399911024) on commit `0044f06` (51s): build, example typecheck, blueprint gates, 47 unit, 41 PostgreSQL, smoke, live connectors, audit, container build |
 
 The PostgreSQL suite includes append-only audit enforcement: the runtime role receives PostgreSQL error `42501` when attempting to update `access_decisions`. It also verifies that cross-tenant foreign-key writes fail, stale lease tokens cannot commit, false verification retries, concurrent job completions cannot leave a stale event aggregate, and review acknowledgement leaves the artifact blocked.
 
@@ -79,9 +79,11 @@ controlled comparison; concurrency, pool contention, tenant skew, and real auth 
 
 ## Remote CI qualification
 
-GitHub Actions run [42396690030](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42396690030) passed on `ubuntu-24.04` with Node 22, `pgvector/pgvector:pg17`, and `redis:7-alpine` services. It executed:
+GitHub Actions run [42399911024](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42399911024) passed on `ubuntu-24.04` with Node 22, `pgvector/pgvector:pg17`, and `redis:7-alpine` services. It executed:
 
-- Build, example typecheck, blueprint gates, unit tests, PostgreSQL tests, and HTTP smoke.
+- Build, example typecheck, and the three blueprint gates (SDK deps, gzipped size, storage boundary).
+- **47/47** unit tests and **41/41** PostgreSQL tests, including the five chaos scenarios.
+- HTTP smoke.
 - Live Redis delete-by-default invalidation and opt-in TTL-preserving tombstones: **1/1 pass**.
 - Live pgvector row deletion/idempotent verification: **1/1 pass**.
 - Production dependency audit: pass.

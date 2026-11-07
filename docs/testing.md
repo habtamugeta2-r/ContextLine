@@ -76,7 +76,7 @@ Without these variables, tests are explicitly skipped—not reported as passed. 
 4. `npm audit --omit=dev --audit-level=high`.
 5. Docker image build.
 
-The workflow has been executed remotely: GitHub Actions run [42396690030](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42396690030) passed build, unit/PostgreSQL/smoke tests, live Redis/pgvector tests, production audit, and Docker image build. Local sandbox results and remaining gaps are recorded in [validation](validation.md).
+The workflow has been executed remotely: GitHub Actions run [42399911024](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42399911024) passed build, example typecheck, blueprint gates, unit/PostgreSQL/smoke tests, live Redis/pgvector tests, production audit, and Docker image build. Local sandbox results and remaining gaps are recorded in [validation](validation.md).
 
 ## 5. Benchmark methodology
 

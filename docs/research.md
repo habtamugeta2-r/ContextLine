@@ -133,7 +133,7 @@ Do not proceed to a hosted control plane until self-managed adoption proves the 
 - No independent comparison against commercial governance products.
 - No production-scale benchmark, HA failover test, or real customer auth-service integration in this sandbox.
 - Redis/pgvector live tests are implemented but were not run locally without those services.
-- Docker/CI files exist and remote CI passed on run 42396690030, including live Redis/pgvector and image build; full Compose/runtime qualification remains open.
+- Docker/CI files exist and remote CI passed on run 42399911024, including the blueprint gates, live Redis/pgvector, and image build; full Compose/runtime qualification remains open.
 - Legal analysis is engineering-oriented and requires counsel for a specific deployment.
 
 These gaps are recorded rather than filled with invented numbers. The next research iteration should prioritize interviews and real integration drills over more market-size prose.
