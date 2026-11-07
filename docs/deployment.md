@@ -124,7 +124,7 @@ Then:
 docker compose up --build
 ```
 
-The example connector tables still need to exist before processing real jobs. Compose is not HA, does not configure TLS between local services, and is not a production security baseline. The sandbox had no Docker daemon; container build/run was not locally executed. CI includes a build step, and operators must qualify the full stack in their environment.
+The example connector tables still need to exist before processing real jobs. Compose is not HA, does not configure TLS between local services, and is not a production security baseline. The sandbox had no Docker daemon; container build/run was not locally executed. Remote CI passed the image build, and operators must still qualify the full running stack in their environment.
 
 ## 7. Production readiness checklist
 

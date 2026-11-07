@@ -6,7 +6,7 @@ This roadmap is evidence-gated. Items are not commitments or claims of current i
 
 **Goal:** prove the shipped core loop in environments beyond the sandbox.
 
-- [ ] Run GitHub Actions end-to-end after push, including live Redis/pgvector and Docker build.
+- [x] Run GitHub Actions end-to-end after push, including live Redis/pgvector and Docker build.
 - [ ] Run the full stack on a Docker/host environment with real connector tables.
 - [ ] Integrate one authoritative customer auth callback and measure revocation-to-denial behavior.
 - [ ] Load test with realistic network, pool contention, auth latency, audit volume, and tenant skew.

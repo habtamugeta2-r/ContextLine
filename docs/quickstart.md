@@ -128,7 +128,7 @@ Set strong, URL-encoded passwords in `.env` as described in [deployment](deploym
 docker compose up --build
 ```
 
-The container files are provided for reproducibility; this sandbox did not have a Docker daemon, so local validation used the real embedded PostgreSQL cluster instead. CI includes a container build step.
+The container files are provided for reproducibility; this sandbox did not have a Docker daemon, so local validation used the real embedded PostgreSQL cluster instead. Remote CI passed the container build step; full Compose runtime qualification is still an operator task.
 
 ## Troubleshooting
 

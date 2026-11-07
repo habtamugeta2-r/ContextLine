@@ -1,6 +1,6 @@
 # Validation results
 
-**Recorded:** 2026-11-07, in the Arena sandbox checkout. These are observed local results, not remote CI status, production certification, or a guarantee about other environments.
+**Recorded:** 2026-11-07. This file separates observed Arena sandbox results from remote GitHub Actions results. Neither is a production certification or a guarantee about other environments.
 
 ## Environment
 
@@ -24,6 +24,7 @@
 | `npm run demo:cli` | Pass | Fresh temporary cluster; revocation/deletion/isolation scenario |
 | Interactive HTTP checks | Pass | Snapshot/query/reset against the running demo server |
 | Worker CLI against the demo registry | Pass | Env-driven startup, `/health`, unique Prometheus TYPE headers, 404 for unknown route, graceful stop |
+| GitHub Actions CI | **Pass** | Run [42396690030](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42396690030) on commit `3929a73`: build, unit, PostgreSQL, smoke, live connectors, audit, container build |
 
 The PostgreSQL suite includes append-only audit enforcement: the runtime role receives PostgreSQL error `42501` when attempting to update `access_decisions`. It also verifies that cross-tenant foreign-key writes fail, stale lease tokens cannot commit, false verification retries, concurrent job completions cannot leave a stale event aggregate, and review acknowledgement leaves the artifact blocked.
 
@@ -56,11 +57,22 @@ Latest recorded run after the final hardening pass:
 
 **Interpretation:** the original `<5ms p95` aspiration is **not achieved** by this local durable path. The result is specific to this sandbox and workload; it is neither a production SLA nor a controlled comparison. Profiling, realistic network/auth latency, concurrency, pool contention, tenant skew, and storage/audit tuning are required before making performance claims. Do not cite earlier pre-batching or pre-hardening runs as the current result.
 
-## Not locally validated
+## Remote CI qualification
 
-- Live Redis TTL/tombstone behavior and live pgvector deletion: test code exists, but both tests were skipped here.
-- Docker image build/run and Compose stack: files exist; no local Docker daemon.
-- Remote GitHub Actions execution: workflow exists; check the repository's Actions results after push.
+GitHub Actions run [42396690030](https://github.com/habtamugeta2-r/ContextLine/actions/runs/42396690030) passed on `ubuntu-24.04` with Node 22, `pgvector/pgvector:pg17`, and `redis:7-alpine` services. It executed:
+
+- Build, 35 unit tests, 28 PostgreSQL tests, and HTTP smoke.
+- Live Redis TTL/tombstone/delete verification: **1/1 pass**.
+- Live pgvector row deletion/idempotent verification: **1/1 pass**.
+- Production dependency audit: pass.
+- Docker image build: pass.
+
+Getting CI green exposed and fixed two environment bugs: PostgreSQL Unix-socket paths can exceed the server limit in deep CI checkout directories, and nested `*.tsbuildinfo` files could make Docker's TypeScript build skip emitting worker output. The socket directory is now a short temp path, and the Docker context ignores all build-info files.
+
+## Still not validated
+
+- Local sandbox Redis/pgvector services: live tests were skipped locally; CI qualified them against service containers.
+- Docker image run and full Compose stack with real application connector tables: CI built the image, but did not run the full Compose qualification stack.
 - Production HA/failover, backup-restore replay, real customer auth callbacks, and large-scale load.
 - Browser visual/interaction testing beyond HTTP asset/API checks; no browser automation binary was available in the sandbox.
 

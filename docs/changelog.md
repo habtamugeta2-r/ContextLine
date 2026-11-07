@@ -23,10 +23,13 @@ Initial working reference implementation recorded in the repository.
 - Worker tenant drain scoped to the requested tenant; Prometheus TYPE headers emitted once per metric.
 - Event aggregate refreshes serialized under an event row lock to prevent stale concurrent completion snapshots.
 - Demo documentation route corrected for uppercase filenames.
+- Embedded PostgreSQL uses a short temporary socket directory for deep CI checkout paths.
+- Docker runtime installs production dependencies separately and ignores nested TypeScript build-info files.
+- CI pinned to Ubuntu 24.04/current actions and passed end-to-end, including live Redis/pgvector and container build.
 - Unsupported market/legal/latency absolutes replaced with evidence labels and measured results.
 
 ### Known limitations
 - Hosted control plane, SSO, billing, dynamic tenant discovery, and broad connector coverage are not implemented.
 - Local durable-audit benchmark p95 is about 137ms; the draft `<5ms` target is unmet.
-- Redis/pgvector live tests, Docker execution, remote CI, production HA, and real customer auth integration were not locally qualified in the sandbox.
+- Local sandbox Redis/pgvector services and Docker runtime were unavailable; remote CI qualified live connectors and image build. Full Compose runtime, production HA, and real customer auth integration remain open.
 - Backups, model weights, downstream copies, prompt injection, and legal compliance remain outside the core guarantee.
