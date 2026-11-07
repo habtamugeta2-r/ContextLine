@@ -29,7 +29,7 @@
     "typecheck:examples": "tsc -p examples/tsconfig.json"
   },
   "devDependencies": {
-    "@types/node": "22.20.3",
+    "@types/node": "26.6.6",
     "@types/pg": "8.23.1",
     "@embedded-postgres/linux-x64": "17.9.0-beta.17",
     "tsx": "4.23.15",
