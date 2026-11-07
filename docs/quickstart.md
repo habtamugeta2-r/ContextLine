@@ -24,7 +24,7 @@ npm run build
 npm run demo
 ```
 
-The server binds to `0.0.0.0:3000` for container/live-preview compatibility. Its internal PostgreSQL cluster binds only to loopback on port `55432` and a private Unix socket. Data persists in `.contextline/demo-db/`.
+The server binds to `0.0.0.0:3000` for container/live-preview compatibility. Its internal PostgreSQL cluster binds only to loopback on port `55432` and uses a short temporary Unix-socket directory to avoid PostgreSQL path-length limits. Data persists in `.contextline/demo-db/`.
 
 ```bash
 PORT=3001 DEMO_DATABASE_PORT=55433 npm run demo

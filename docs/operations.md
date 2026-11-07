@@ -137,7 +137,7 @@ PGCTL=node_modules/@embedded-postgres/linux-x64/native/bin/pg_ctl
 "$PGCTL" -D .contextline/demo-db -m fast -w stop
 ```
 
-Do not remove `postmaster.pid` while a server is alive. Logs are in `.contextline/demo-db/server.log`. The demo's internal port can vary after recovery; the application configures the port it started. Temporary CLI/test/smoke clusters use random directories and ports and clean up after themselves.
+Do not remove `postmaster.pid` while a server is alive. Logs are in `.contextline/demo-db/server.log`. The demo's internal port can vary after recovery; the application configures the port it started. Unix sockets are placed in a short temporary directory because deep checkout paths can exceed PostgreSQL's socket-path limit. Temporary CLI/test/smoke clusters use random directories and ports and clean up after themselves.
 
 **Reset demo** clears only the selected tenant's synthetic registry/audit/demo rows and reseeds it. It pauses the worker during reset. It is not a production retention or erasure tool.
 
